@@ -1,34 +1,30 @@
 name: Build coresight-etm4x.ko (shennong / SM8650)
 
-# Builds the missing APSS ETE/ETMv4 driver module for Xiaomi 14 Pro (shennong).
+# Builds the missing APSS ETE/ETMv4 driver module for the Xiaomi 14 Pro
+# (shennong / SM8650) from Xiaomi's own OSS source, then packages it as a
+# KernelSU / Magisk module.
 #
-# Why this is needed
-# ------------------
-# Xiaomi's shipping vendor-module config only enables the CoreSight
-# *infrastructure*:
+# See README.md for the full rationale; the short version:
 #
-#   arch/arm64/configs/vendor/pineapple_GKI.config   <-- 13 CONFIG_CORESIGHT_* lines
-#                                                        but NO CONFIG_CORESIGHT_SOURCE_ETM4X
-#   arch/arm64/configs/vendor/pineapple_consolidate.config  <-- debug-only delta which DOES
-#                                                               set CONFIG_CORESIGHT_SOURCE_ETM4X=m
+#   * pineapple_GKI.config (the config that produced the shipped /vendor_dlkm)
+#     enables 13 CONFIG_CORESIGHT_* symbols but NOT
+#     CONFIG_CORESIGHT_SOURCE_ETM4X, which only appears in the internal debug
+#     variant pineapple_consolidate.config.  Hence the DT nodes ete0..7 have no
+#     driver and `cs_etm` ends up with zero CPUs.
 #
-# The DT nodes ete0..7 ("arm,embedded-trace-extension") are present and enabled,
-# the platform devices soc:ete0..7 exist, but no driver ever binds them because
-# coresight-etm4x.ko is simply not shipped.
+#   * kernel/module/version.c :: same_magic() ignores the version prefix of the
+#     vermagic string when the module carries a __versions section, so a module
+#     built here loads on the 6.1.138 device kernel even though this tree is
+#     based on 6.1.25.
 #
-# Why a module built from a different tree still loads
-# ---------------------------------------------------
-#   kernel/module/version.c :: same_magic()
-#       when the module carries a __versions section (CONFIG_MODVERSIONS) the
-#       kernel compares ONLY the trailing flags of the vermagic
-#       ("SMP preempt mod_unload modversions aarch64"), NOT the version prefix.
-#   kernel/module/version.c :: check_version()
-#       a recorded symbol CRC of 0 is accepted unconditionally.
-#   kernel/module/signing.c (ANDROID: GKI)
-#       with CONFIG_MODULE_SIG_PROTECT=y signature enforcement is disabled.
+#   * kernel/module/version.c :: check_version() treats a recorded symbol CRC of
+#     0 as a match, which is what tools/patch_modpost.py arranges.
 #
-# So this workflow also emits a "-crc0" variant with every modversions CRC
-# zeroed, and the KernelSU module is packaged with that variant.
+#   * kernel/module/signing.c: with CONFIG_MODULE_SIG_PROTECT=y (device config)
+#     signature enforcement is off, so an unsigned module loads.
+#
+# Xiaomi's OSS snapshot is incomplete (drivers/misc/hwid is referenced but not
+# shipped), which tools/repair_tree.py fixes by stubbing the dangling Kconfig.
 
 on:
   workflow_dispatch:
@@ -49,7 +45,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 200
 
     steps:
       - name: Checkout builder
@@ -90,55 +86,89 @@ jobs:
           echo "$PWD/$DEST/bin" >> "$GITHUB_PATH"
           "$DEST/bin/clang" --version
 
+      - name: Repair incomplete vendor tree
+        run: |
+          set -x
+          python3 tools/repair_tree.py "$SRC"
+
+      - name: Patch modpost to emit CRC 0 for every symbol
+        run: |
+          set -x
+          python3 tools/patch_modpost.py "$SRC/scripts/mod/modpost.c"
+          sed -n '/static void add_versions/,/^}/p' "$SRC/scripts/mod/modpost.c"
+
       - name: Configure kernel
         run: |
+          set -eux
           cd "$SRC"
           make ARCH=arm64 LLVM=1 O=out gki_defconfig
-          scripts/kconfig/merge_config.sh -O out out/.config \
-            arch/arm64/configs/vendor/pineapple_GKI.config \
-            arch/arm64/configs/vendor/shennong_GKI.config || true
           printf '%s\n' \
+            'CONFIG_CORESIGHT=m' \
+            'CONFIG_CORESIGHT_LINKS_AND_SINKS=m' \
+            'CONFIG_CORESIGHT_LINK_AND_SINK_TMC=m' \
             'CONFIG_CORESIGHT_SOURCE_ETM4X=m' \
             'CONFIG_MODULE_SIG_ALL=n' >> out/.config
           make ARCH=arm64 LLVM=1 O=out olddefconfig
-          echo "----- relevant config after olddefconfig -----"
-          grep -E 'CORESIGHT|CFI_CLANG|MODVERSIONS|^CONFIG_PREEMPT=|^CONFIG_SMP=|^CONFIG_MODULE_UNLOAD=' \
+          echo "----- coresight / modversion config -----"
+          grep -E 'CORESIGHT|MODVERSIONS|MODULE_SIG|CFI_CLANG|^CONFIG_PREEMPT=|^CONFIG_SMP=|^CONFIG_MODULE_UNLOAD=' \
             out/.config | sort
-          echo "----------------------------------------------"
+          echo "-----------------------------------------"
 
-      - name: Build kernel + modules
+      - name: Prepare build
         run: |
+          set -eux
           cd "$SRC"
-          nproc
-          free -h
-          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)"
+          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare
 
-      - name: Fallback build (modules only) if the full build failed
-        if: failure()
+      - name: Build coresight modules
         run: |
+          set -eux
           cd "$SRC"
-          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare || true
-          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules || true
+          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out \
+            -j"$(nproc)" M=drivers/hwtracing/coresight || \
+          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out \
+            -j"$(nproc)" M=drivers/hwtracing/coresight modules
 
-      - name: Collect results
+      - name: Locate and inspect the module
         run: |
-          set -x
+          set -eux
           cd "$SRC"
-          find out -name 'coresight*.ko' -print | sort
-          ls -l out/Module.symvers 2>/dev/null || echo "no Module.symvers"
+          KO=$(find . -name 'coresight-etm4x.ko' -print -quit)
+          test -n "$KO"
+          echo "KO=$KO"
+          ls -l "$KO"
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp out/drivers/hwtracing/coresight/coresight-etm4x.ko "$GITHUB_WORKSPACE/dist/" || true
-          ls -l "$GITHUB_WORKSPACE/dist"
+          cp "$KO" "$GITHUB_WORKSPACE/dist/coresight-etm4x.ko"
+          echo "----- vermagic -----"
+          strings "$KO" | grep -i '^vermagic=' || true
+          echo "----- __versions -----"
+          python3 "$GITHUB_WORKSPACE/tools/modversions.py" dump \
+            "$GITHUB_WORKSPACE/dist/coresight-etm4x.ko" | head -25
+          echo "----- sections -----"
+          strings "$KO" | grep -iE 'coresight-etm4x|kcfi|__cfi' | head -10 || true
 
-      - name: Make modversions-CRC-0 variant
+      - name: Verify __versions is present
         run: |
           set -eux
           cd "$GITHUB_WORKSPACE"
-          chmod +x tools/modversions.py
-          python3 tools/modversions.py dump dist/coresight-etm4x.ko | head -20
+          if python3 tools/modversions.py dump dist/coresight-etm4x.ko | grep -q 'NO __versions'; then
+            echo "::error::module has no __versions section; same_magic() would compare the full vermagic and the module would be rejected"
+            exit 1
+          fi
           cp dist/coresight-etm4x.ko dist/coresight-etm4x-crc0.ko
           python3 tools/modversions.py zero dist/coresight-etm4x-crc0.ko
-          python3 tools/modversions.py dump dist/coresight-etm4x-crc0.ko | head -20
+          python3 tools/modversions.py dump dist/coresight-etm4x-crc0.ko | head -10
+
+      - name: Compare against the device's own coresight.ko
+        run: |
+          set +e
+          if [ -f refs/coresight.ko ]; then
+            python3 tools/modversions.py compare refs/coresight.ko \
+              --target dist/coresight-etm4x.ko | tail -30
+          else
+            echo "no reference module committed"
+          fi
+          exit 0
 
       - name: Package KernelSU / Magisk module zip
         run: |
@@ -146,7 +176,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cp dist/coresight-etm4x-crc0.ko ksu-module/coresight-etm4x.ko
           chmod +x ksu-module/post-fs-data.sh ksu-module/service.sh
-          ( cd ksu-module && zip -r9 "$GITHUB_WORKSPACE/dist/ksu-coresight-etm4x.zip" . -x '.*' )
+          ( cd ksu-module && zip -r9 "$GITHUB_WORKSPACE/dist/ksu-coresight-etm4x.zip" . )
           unzip -l dist/ksu-coresight-etm4x.zip
 
       - name: Upload artifacts
@@ -157,5 +187,5 @@ jobs:
             dist/coresight-etm4x.ko
             dist/coresight-etm4x-crc0.ko
             dist/ksu-coresight-etm4x.zip
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
