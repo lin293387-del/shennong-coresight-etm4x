@@ -1,0 +1,6 @@
+id=coresight_etm4x
+name=CoreSight ETE/ETMv4 for shennong (SM8650)
+version=v1.0
+versionCode=1
+author=lin293387-del
+description=Loads coresight-etm4x.ko at boot so the APSS ETE0-7 trace sources get a driver (enables perf cs_etm instruction tracing). Nothing outside /data is modified. Auto-disables itself after 3 failed boots; touch /data/adb/coresight/DISABLE to turn it off manually.

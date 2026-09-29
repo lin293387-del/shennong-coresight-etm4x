@@ -1,0 +1,161 @@
+name: Build coresight-etm4x.ko (shennong / SM8650)
+
+# Builds the missing APSS ETE/ETMv4 driver module for Xiaomi 14 Pro (shennong).
+#
+# Why this is needed
+# ------------------
+# Xiaomi's shipping vendor-module config only enables the CoreSight
+# *infrastructure*:
+#
+#   arch/arm64/configs/vendor/pineapple_GKI.config   <-- 13 CONFIG_CORESIGHT_* lines
+#                                                        but NO CONFIG_CORESIGHT_SOURCE_ETM4X
+#   arch/arm64/configs/vendor/pineapple_consolidate.config  <-- debug-only delta which DOES
+#                                                               set CONFIG_CORESIGHT_SOURCE_ETM4X=m
+#
+# The DT nodes ete0..7 ("arm,embedded-trace-extension") are present and enabled,
+# the platform devices soc:ete0..7 exist, but no driver ever binds them because
+# coresight-etm4x.ko is simply not shipped.
+#
+# Why a module built from a different tree still loads
+# ---------------------------------------------------
+#   kernel/module/version.c :: same_magic()
+#       when the module carries a __versions section (CONFIG_MODVERSIONS) the
+#       kernel compares ONLY the trailing flags of the vermagic
+#       ("SMP preempt mod_unload modversions aarch64"), NOT the version prefix.
+#   kernel/module/version.c :: check_version()
+#       a recorded symbol CRC of 0 is accepted unconditionally.
+#   kernel/module/signing.c (ANDROID: GKI)
+#       with CONFIG_MODULE_SIG_PROTECT=y signature enforcement is disabled.
+#
+# So this workflow also emits a "-crc0" variant with every modversions CRC
+# zeroed, and the KernelSU module is packaged with that variant.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+  KERNEL_BRANCH: shennong-u-oss
+  CLANG_TAG: clang-r487747c
+  CLANG_REF: android-14.0.0_r1
+  SRC: kernel
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache \
+                      /usr/local/lib/node_modules /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod rsync zip unzip \
+            ccache zstd curl git-lfs
+          git lfs install --skip-repo || true
+
+      - name: Clone Xiaomi kernel source (${{ env.KERNEL_BRANCH }})
+        run: |
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" "$SRC"
+          rm -rf "$SRC/.git"
+          du -sh "$SRC"
+
+      - name: Fetch AOSP clang ${{ env.CLANG_TAG }}
+        run: |
+          DEST="prebuilts/clang/host/linux-x86/${CLANG_TAG}"
+          mkdir -p "$DEST"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_REF}/${CLANG_TAG}.tar.gz"
+          echo "downloading $URL"
+          curl -fL --retry 3 -o /tmp/clang.tar.gz "$URL"
+          tar -xzf /tmp/clang.tar.gz -C "$DEST"
+          rm -f /tmp/clang.tar.gz
+          echo "$PWD/$DEST/bin" >> "$GITHUB_PATH"
+          "$DEST/bin/clang" --version
+
+      - name: Configure kernel
+        run: |
+          cd "$SRC"
+          make ARCH=arm64 LLVM=1 O=out gki_defconfig
+          scripts/kconfig/merge_config.sh -O out out/.config \
+            arch/arm64/configs/vendor/pineapple_GKI.config \
+            arch/arm64/configs/vendor/shennong_GKI.config || true
+          printf '%s\n' \
+            'CONFIG_CORESIGHT_SOURCE_ETM4X=m' \
+            'CONFIG_MODULE_SIG_ALL=n' >> out/.config
+          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          echo "----- relevant config after olddefconfig -----"
+          grep -E 'CORESIGHT|CFI_CLANG|MODVERSIONS|^CONFIG_PREEMPT=|^CONFIG_SMP=|^CONFIG_MODULE_UNLOAD=' \
+            out/.config | sort
+          echo "----------------------------------------------"
+
+      - name: Build kernel + modules
+        run: |
+          cd "$SRC"
+          nproc
+          free -h
+          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)"
+
+      - name: Fallback build (modules only) if the full build failed
+        if: failure()
+        run: |
+          cd "$SRC"
+          make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare || true
+          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules || true
+
+      - name: Collect results
+        run: |
+          set -x
+          cd "$SRC"
+          find out -name 'coresight*.ko' -print | sort
+          ls -l out/Module.symvers 2>/dev/null || echo "no Module.symvers"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp out/drivers/hwtracing/coresight/coresight-etm4x.ko "$GITHUB_WORKSPACE/dist/" || true
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Make modversions-CRC-0 variant
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          chmod +x tools/modversions.py
+          python3 tools/modversions.py dump dist/coresight-etm4x.ko | head -20
+          cp dist/coresight-etm4x.ko dist/coresight-etm4x-crc0.ko
+          python3 tools/modversions.py zero dist/coresight-etm4x-crc0.ko
+          python3 tools/modversions.py dump dist/coresight-etm4x-crc0.ko | head -20
+
+      - name: Package KernelSU / Magisk module zip
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          cp dist/coresight-etm4x-crc0.ko ksu-module/coresight-etm4x.ko
+          chmod +x ksu-module/post-fs-data.sh ksu-module/service.sh
+          ( cd ksu-module && zip -r9 "$GITHUB_WORKSPACE/dist/ksu-coresight-etm4x.zip" . -x '.*' )
+          unzip -l dist/ksu-coresight-etm4x.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coresight-etm4x
+          path: |
+            dist/coresight-etm4x.ko
+            dist/coresight-etm4x-crc0.ko
+            dist/ksu-coresight-etm4x.zip
+          if-no-files-found: warn
+          retention-days: 30
