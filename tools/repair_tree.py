@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stub Kconfig files that the tree references but does not contain.
+"""Disable Kconfig `source` statements whose target file is not in the tree.
 
-Xiaomi's OSS snapshot of `shennong-u-oss` is incomplete: for example
-`drivers/misc/Kconfig` still contains
+Xiaomi's OSS snapshot of `shennong-u-oss` is incomplete: `drivers/misc/Kconfig`
+still contains
 
     source "drivers/misc/hwid/Kconfig"
 
@@ -11,16 +11,21 @@ while `drivers/misc/hwid/` was stripped from the release, and
 
     obj-$(CONFIG_MI_HARDWARE_ID)   += hwid/
 
-The first line makes *every* `make *_defconfig` / `olddefconfig` invocation fail
+The first line makes *every* `make *_defconfig` / `olddefconfig` invocation die
 with
 
     drivers/misc/Kconfig:540: can't open file "drivers/misc/hwid/Kconfig"
 
-Creating an empty stub for each dangling `source`/`osource` target fixes the
-parse, and because the stub defines no symbols the matching `obj-$(CONFIG_...)`
-lines in the Makefiles stay empty.  Nothing that we actually want to build is
-lost - the stripped directories are all Xiaomi-specific drivers (MI_HARDWARE_ID,
-etc.), none of which the CoreSight module depends on.
+so the tree cannot be configured at all.
+
+Rather than guessing how kconfig resolves the path (kernel Kconfigs use
+root-relative paths, but kconfig also accepts paths relative to the including
+file), this script resolves the target under *both* conventions and only
+comments the statement out when neither candidate exists.  Because the
+statement disappears, the symbols it would have defined stay undefined, and the
+matching `obj-$(CONFIG_...)` lines in the Makefiles evaluate to nothing - which
+is exactly what we want: the stripped directories are all Xiaomi-specific
+drivers (MI_HARDWARE_ID, ...) that the CoreSight module does not need.
 
 Usage:  repair_tree.py <kernel-src>
 """
@@ -29,7 +34,8 @@ import os
 import re
 import sys
 
-SOURCE_RE = re.compile(r'^\s*(?:source|osource)\s+"([^"]+)"')
+SOURCE_RE = re.compile(r'^(\s*)(source|osource)(\s+)("([^"]+)")(.*)$')
+MARKER = "# disabled by tools/repair_tree.py"
 
 
 def iter_kconfigs(root):
@@ -40,6 +46,15 @@ def iter_kconfigs(root):
                 yield os.path.join(dirpath, name)
 
 
+def candidates(root, kpath, target):
+    if target.startswith("/"):
+        return [os.path.join(root, target.lstrip("/"))]
+    return [
+        os.path.normpath(os.path.join(os.path.dirname(kpath), target)),
+        os.path.normpath(os.path.join(root, target)),
+    ]
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: repair_tree.py <kernel-src>")
@@ -47,45 +62,50 @@ def main():
     if not os.path.isdir(root):
         raise SystemExit(f"{root}: not a directory")
 
-    created = []
+    disabled = []
     for kpath in iter_kconfigs(root):
         try:
             with open(kpath, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
         except OSError:
             continue
+
+        changed = False
+        out = []
         for line in lines:
+            if MARKER in line:
+                out.append(line)
+                continue
             m = SOURCE_RE.match(line)
             if not m:
+                out.append(line)
                 continue
-            target = m.group(1)
-            # Skip anything the static parser cannot resolve.  $(VAR) forms are
-            # resolved by kconfig itself (arch/$SRCARCH/...), and a leading '/'
-            # is relative to the source root.
-            if "$" in target:
-                continue
-            if target.startswith("/"):
-                rel = os.path.join(root, target.lstrip("/"))
-            else:
-                rel = os.path.normpath(os.path.join(os.path.dirname(kpath), target))
-            if os.path.exists(rel):
-                continue
-            os.makedirs(os.path.dirname(rel), exist_ok=True)
-            with open(rel, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "# Stub created by tools/repair_tree.py.\n"
-                    f"# Referenced by {os.path.relpath(kpath, root)} as \"{target}\"\n"
-                    "# but missing from Xiaomi's OSS snapshot.  An empty Kconfig\n"
-                    "# keeps the tree parseable; the symbols it would have defined\n"
-                    "# (and therefore the matching obj-$(CONFIG_...) Makefile lines)\n"
-                    "# simply stay disabled.\n"
-                )
-            created.append(os.path.relpath(rel, root))
 
-    if created:
-        print(f"created {len(created)} stub Kconfig file(s):")
-        for path in sorted(created):
-            print(f"  {path}")
+            indent, keyword, _sp, quoted, target, tail = m.groups()
+            if "$" in target:
+                # kconfig expands $(VAR); we cannot check it statically, and
+                # those are always generated or arch-local files.
+                out.append(line)
+                continue
+
+            if any(os.path.exists(c) for c in candidates(root, kpath, target)):
+                out.append(line)
+                continue
+
+            out.append(f"{indent}{MARKER}: missing-in-snapshot {keyword} {quoted}{tail}")
+            disabled.append(
+                f"{os.path.relpath(kpath, root)}: {keyword} {quoted}"
+            )
+            changed = True
+
+        if changed:
+            with open(kpath, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(out) + "\n")
+
+    if disabled:
+        print(f"disabled {len(disabled)} dangling Kconfig source(s):")
+        for item in sorted(disabled):
+            print(f"  {item}")
     else:
         print("no dangling Kconfig sources found")
     return 0
