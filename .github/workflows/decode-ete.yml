@@ -1,0 +1,123 @@
+name: decode-ete
+
+# Decode a Xiaomi 14 Pro (shennong, SM8650) CoreSight ETE v1.1 capture with a
+# real Linux perf that is linked against a modern OpenCSD.
+#
+# Why this runs on a Linux runner: tools/perf is Linux-only, and the whole point
+# is to reproduce perf's own decode path (tools/perf/util/cs-etm.c +
+# cs-etm-decoder.c) exactly as it would behave on the device's host, with the
+# OpenCSD version under our control.
+#
+# The capture is uploaded as a release asset so the runner can pull it with plain
+# curl.  Two variants are published:
+#    meta.data        -- as captured (AUXTRACE_INFO says TRCTRACEIDR 0x10..0x1e)
+#    meta-fixed.data  -- same bytes, per-CPU trace IDs rewritten to the ATB IDs
+#                        the sink actually frames with (1..8).  See
+#                        tools/perfdata_fix_traceid.py.
+# Decoding both proves where the failure lives.
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset:
+        description: 'release asset file name to decode'
+        required: false
+        default: 'meta-fixed.data'
+      itrace:
+        description: 'perf inject --itrace spec'
+        required: false
+        default: 'i100000il'
+
+jobs:
+  decode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Show environment
+        run: |
+          uname -a
+          nproc
+          df -h / /mnt 2>/dev/null | head -5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential flex bison pkg-config \
+            libelf-dev libdw-dev libunwind-dev libcap-dev libnuma-dev \
+            libssl-dev zlib1g-dev liblzma-dev libzstd-dev \
+            libtraceevent-dev libslang2-dev libperl-dev python3-dev \
+            systemtap-sdt-dev libbabeltrace-dev libc6-dev-i386 gcc-multilib
+
+      - name: Build and install OpenCSD v1.8.3
+        run: |
+          git clone --depth=1 -b v1.8.3 https://github.com/Linaro/OpenCSD.git opencsd
+          make -C opencsd/decoder/build/linux -j"$(nproc)"
+          sudo make -C opencsd/decoder/build/linux install
+          echo "--- installed headers ---"
+          ls -l /usr/local/include/opencsd/ | head
+          echo "--- installed libs ---"
+          ls -l /usr/local/lib/libopencsd* 2>/dev/null || ls -l /usr/lib/libopencsd* 2>/dev/null || true
+          grep -rn 'OCSD_VER_' /usr/local/include/opencsd/ocsd_if_version.h || true
+
+      - name: Build perf with CoreSight/OpenCSD support
+        run: |
+          git clone --depth=1 -b android14-6.1 https://android.googlesource.com/kernel/common kernel
+          cd kernel/tools/perf
+          make -j"$(nproc)" WERROR=0 CORESIGHT=1 VF=1 2>&1 | tail -40
+          echo "=== perf version ==="
+          ./perf version
+          echo "=== CoreSight support check ==="
+          ./perf version --build-options | tee build-options.txt
+          grep -i -E 'coresight|opencsd' build-options.txt || {
+            echo "!! perf was NOT built with CORESIGHT support"; exit 1; }
+
+      - name: Fetch trace from release asset
+        run: |
+          ASSET="${{ inputs.asset }}"
+          URL="https://github.com/lin293387-del/shennong-coresight-etm4x/releases/download/trace-v1/${ASSET}"
+          echo "downloading $URL"
+          curl -fL --retry 3 -o "$ASSET" "$URL"
+          ls -l "$ASSET"
+          sha256sum "$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Decode -- raw AUX / packet dump
+        run: |
+          set +e
+          ./kernel/tools/perf/perf report --stdio --dump -i "$ASSET" > dump.txt 2>&1
+          echo "exit=$?"
+          echo "================= first 80 lines ================="
+          head -80 dump.txt
+          echo "================= interesting lines ================="
+          grep -n -E 'CoreSight ETM Trace data|Frame deformatter|FSYNC|ID:[0-9a-f]+|I_ASYNC|I_TRACE_INFO|I_TRACE_ON|I_CTXT|I_ADDR|I_ATOM|RESET|Trace buffer done' dump.txt | head -60
+          echo "================= element census ================="
+          grep -o -E 'I_[A-Z_0-9]+|OCSD_GEN_TRC_ELEM_[A-Z_]+' dump.txt | sort | uniq -c | sort -rn | head -25
+
+      - name: Decode -- perf inject instruction samples + branch history
+        run: |
+          set +e
+          ./kernel/tools/perf/perf inject -i "$ASSET" -o inj.data --itrace=${{ inputs.itrace }} -v > inject.log 2>&1
+          echo "inject exit=$?"
+          tail -40 inject.log
+          ls -l inj.data 2>/dev/null
+          echo "================= perf report ================="
+          ./kernel/tools/perf/perf report --stdio -i inj.data --header-only 2>&1 | head -20
+          ./kernel/tools/perf/perf report --stdio -i inj.data 2>&1 | head -40
+          echo "================= perf script ================="
+          ./kernel/tools/perf/perf script -i inj.data 2>&1 | head -30
+          echo "================= sample census ================="
+          ./kernel/tools/perf/perf report --stdio -i inj.data --stats 2>&1 | head -30
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decode-results
+          path: |
+            dump.txt
+            inject.log
+            inj.data
+            build-options.txt
+          if-no-files-found: warn
+          retention-days: 14
