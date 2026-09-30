@@ -96,8 +96,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio kmod rsync zip unzip \
-            ccache zstd curl git
+            ccache zstd curl git dwarves
+          # dwarves = pahole.  It is NOT optional here: lib/Kconfig.debug has
+          #     config DEBUG_INFO_BTF_MODULES
+          #             bool "..." ; default y
+          #             depends on DEBUG_INFO_BTF && MODULES && PAHOLE_HAS_SPLIT_BTF
+          #     config PAHOLE_HAS_SPLIT_BTF
+          #             def_bool PAHOLE_VERSION >= 119
+          # and init/Kconfig derives PAHOLE_VERSION from
+          #     $(shell,$(srctree)/scripts/pahole-version.sh $(PAHOLE))
+          # With no pahole in PATH that shell returns 0, PAHOLE_HAS_SPLIT_BTF
+          # becomes n, DEBUG_INFO_BTF_MODULES becomes *invisible*, and
+          # `make olddefconfig` deletes the line from .config entirely (not even
+          # a "# ... is not set" comment).  Result: sizeof(struct module)==1024
+          # instead of the device's 1088 -- exactly the crash this file fixes.
           df -h / | tail -1
+          pahole --version
 
       - name: Fetch ACK android14-6.1 @ ${{ env.ACK_COMMIT }}
         run: |
@@ -157,6 +171,10 @@ jobs:
           # LOCALVERSION is only cosmetic: same_magic() drops the first token when
           # the module carries __versions.  Make it match anyway.
           LOCALVERSION="-android14-11" make ARCH=arm64 LLVM=1 O=out olddefconfig
+          echo "----- pahole (drives PAHOLE_HAS_SPLIT_BTF >= 119) -----"
+          command -v pahole || echo "::error::pahole missing from PATH"
+          ./scripts/pahole-version.sh pahole || true
+          grep -E '^CONFIG_DEBUG_INFO_BTF(_MODULES)?=|^# CONFIG_DEBUG_INFO_BTF' out/.config || true
           echo "----- ABI-relevant switches -----"
           grep -E '^(CONFIG_(DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|CFI_CLANG|LTO_NONE|LTO_CLANG[A-Z_]*|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|MODULE_SIG|MODULE_SIG_PROTECT|MODULE_FORCE_LOAD|TRACEPOINTS|BPF_EVENTS|JUMP_LABEL|FTRACE_MCOUNT_RECORD|KPROBES|LIVEPATCH|KUNIT|IKCONFIG|PANIC_ON_OOPS|PANIC_TIMEOUT|CORESIGHT[A-Z_]*)=|# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|SHADOW_CALL_STACK) is not set)' out/.config | sort
           echo "---------------------------------"
@@ -164,6 +182,13 @@ jobs:
             echo "::error::CONFIG_DEBUG_INFO_BTF_MODULES is not =y. The shipping kernel has it"
             echo "::error::enabled; without it sizeof(struct module) is 1024 instead of 1088 and the"
             echo "::error::module's exit relocation lands on the kernel's target_list.next (the Oops)."
+            echo "----- diagnosis -----"
+            echo "pahole: $(command -v pahole || echo MISSING)"
+            ./scripts/pahole-version.sh pahole || true
+            grep -n -A4 'config DEBUG_INFO_BTF_MODULES' lib/Kconfig.debug || true
+            grep -n -A3 'config PAHOLE_HAS_SPLIT_BTF' lib/Kconfig.debug || true
+            grep -n -A3 'config PAHOLE_VERSION' init/Kconfig || true
+            grep -i pahole out/.config || echo "(no pahole symbols in .config at all - the symbol was dropped)"
             exit 1
           }
           grep -q '^CONFIG_CORESIGHT_SOURCE_ETM4X=m' out/.config || {
@@ -179,6 +204,56 @@ jobs:
           set -eux
           cd "$SRC"
           make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare
+          # Authoritative check: what kconfig *really* resolved, not what the
+          # .config file claims.  A .config line can survive while syncconfig
+          # drops the symbol because a dependency is unmet - that is exactly the
+          # pahole trap this workflow documents.
+          OUTC="out/include/generated/autoconf.h"
+          grep -E '^#define CONFIG_(DEBUG_INFO_BTF_MODULES|PAHOLE_HAS_SPLIT_BTF|PAHOLE_VERSION|DEBUG_INFO_BTF|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD) ' "$OUTC" | sort
+          grep -q '^#define CONFIG_DEBUG_INFO_BTF_MODULES 1' "$OUTC" || {
+            echo "::error::kconfig resolved CONFIG_DEBUG_INFO_BTF_MODULES to n even though the"
+            echo "::error::.config line is present.  struct module would then be 16 bytes short"
+            echo "::error::and the module would take the device down (see the file header)."
+            exit 1
+          }
+
+      - name: ABI probe (cheap 5-line module, reports struct module layout early)
+        run: |
+          set -eux
+          cd "$SRC"
+          PROBE=/tmp/abiprobe
+          mkdir -p "$PROBE"
+          cat > "$PROBE/probe.c" <<'EOF'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          static int __init probe_init(void)
+          {
+          	pr_info("abiprobe: sizeof(struct module)=%zu init=%zu target_list=%zu exit=%zu\n",
+          		sizeof(struct module), offsetof(struct module, init),
+          		offsetof(struct module, target_list), offsetof(struct module, exit));
+          	return 0;
+          }
+          static void __exit probe_exit(void) { }
+          module_init(probe_init);
+          module_exit(probe_exit);
+          MODULE_LICENSE("GPL");
+          EOF
+          printf 'obj-m := probe.o\n' > "$PROBE/Makefile"
+          # built BEFORE refs/kernel.symvers is installed, and as an external
+          # module, so it cannot pollute out/Module.symvers.  Advisory only: the
+          # post-build gate stays authoritative.
+          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out LOCALVERSION="-android14-11" \
+            -j"$(nproc)" M="$PROBE" modules \
+            || echo "::warning::ABI probe build failed - continuing; the post-build gate decides"
+          if [ -f "$PROBE/probe.ko" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/dist"
+            cp "$PROBE/probe.ko" "$GITHUB_WORKSPACE/dist/probe.ko"
+            python3 "$GITHUB_WORKSPACE/tools/preflight.py" "$PROBE/probe.ko" \
+              --vendor "$GITHUB_WORKSPACE/refs/ref-coresight.ko" \
+              || echo "::warning::ABI probe MISMATCH (numbers above) - the post-build gate will decide"
+          else
+            echo "::warning::probe.ko was not produced"
+          fi
 
       - name: Install the device's symbol CRCs
         run: |
