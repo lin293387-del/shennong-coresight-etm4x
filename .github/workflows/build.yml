@@ -97,6 +97,24 @@ jobs:
           python3 tools/patch_modpost.py "$SRC/scripts/mod/modpost.c"
           sed -n '/static void add_versions/,/^}/p' "$SRC/scripts/mod/modpost.c"
 
+      - name: Fix known vendor prototype drift
+        run: |
+          set -x
+          USBH="$SRC/include/linux/usb/usb_qdss.h"
+          TMCUSB="$SRC/drivers/hwtracing/coresight/coresight-tmc-usb.c"
+          # coresight-tmc-usb.c still calls the 2-argument form of
+          # usb_qdss_alloc_req() while the header in this snapshot declares the
+          # 3-argument one.  We do not build coresight-tmc at all (TMC is left
+          # out of the config fragment because CORESIGHT_SOURCE_ETM4X does not
+          # select it), so this is only a belt-and-braces fix in case a future
+          # config pulls the TMC driver back in.
+          if grep -q 'usb_qdss_alloc_req(struct usb_qdss_ch \*c, int n_wr, int n_rd)' "$USBH" 2>/dev/null; then
+            sed -i 's/usb_qdss_alloc_req(ch, USB_BUF_NUM)/usb_qdss_alloc_req(ch, USB_BUF_NUM, USB_BUF_NUM)/' "$TMCUSB"
+            grep -n 'usb_qdss_alloc_req(ch' "$TMCUSB" || true
+          else
+            echo "header uses a different prototype - skipping"
+          fi
+
       - name: Configure kernel
         run: |
           set -eux
@@ -104,8 +122,6 @@ jobs:
           make ARCH=arm64 LLVM=1 O=out gki_defconfig
           printf '%s\n' \
             'CONFIG_CORESIGHT=m' \
-            'CONFIG_CORESIGHT_LINKS_AND_SINKS=m' \
-            'CONFIG_CORESIGHT_LINK_AND_SINK_TMC=m' \
             'CONFIG_CORESIGHT_SOURCE_ETM4X=m' \
             'CONFIG_MODULE_SIG_ALL=n' >> out/.config
           make ARCH=arm64 LLVM=1 O=out olddefconfig
@@ -133,6 +149,8 @@ jobs:
         run: |
           set -eux
           cd "$SRC"
+          echo "----- every module that was built -----"
+          find . -name '*.ko' -printf '%p  %s bytes\n' | sort
           KO=$(find . -name 'coresight-etm4x.ko' -print -quit)
           test -n "$KO"
           echo "KO=$KO"
