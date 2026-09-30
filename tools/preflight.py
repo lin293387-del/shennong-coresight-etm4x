@@ -48,6 +48,76 @@ def this_module_info(path):
         return size, relocs
 
 
+# ------------------------------------------------------------------ kCFI bits
+#
+# On arm64 kCFI (CONFIG_CFI_CLANG -> clang -fsanitize=kcfi) there is no
+# __cfi_check stub: the check is *inlined at every indirect call site* as
+#
+#     ldur w16, [x8, #-4]      ; <- the callee's 32-bit type id
+#     cmp  w16, #<expected>
+#     b.ne <trap>
+#
+# so the number of checks tracks the number of indirect calls.  Measured on this
+# device's own vendor modules (which load fine): coresight.ko 49 blr / 48 checks,
+# coresight-tmc.ko 34 blr / 33 checks.  The old cs.ko had 0 / 0.
+#
+# Counting `__kcfi_typeid_*` symbols instead is WRONG: clang emits those absolute
+# symbols only when a type id has to be materialised for a function that is
+# declared but not defined in the unit (e.g. ref-tmc.ko has exactly two:
+# coresight_simple_show32 / coresight_simple_show_pair, both imported).  A module
+# with zero imported address-taken functions can be fully kCFI-instrumented and
+# still have zero __kcfi_typeid_* symbols -- which is why the old check rejected
+# a good build.
+KCFI_CHECK = 0xB85FC110          # ldur w16, [x8, #-4]
+BLR_MASK = 0xFFFFFC1F
+BLR_OPC = 0xD63F0000             # blr xN
+
+
+def kcfi_metrics(path):
+    """(indirect calls, kCFI call-site checks) over every executable section."""
+    blr = kcfi = 0
+    with open(path, "rb") as f:
+        elf = ELFFile(f)
+        for sec in elf.iter_sections():
+            if not (sec["sh_flags"] & 0x4):      # SHF_EXECINSTR
+                continue
+            d = sec.data()
+            for i in range(0, len(d) - 3, 4):
+                w = int.from_bytes(d[i:i + 4], "little")
+                if w == KCFI_CHECK:
+                    kcfi += 1
+                elif (w & BLR_MASK) == BLR_OPC:
+                    blr += 1
+    return blr, kcfi
+
+
+def typeid_prefix(path, fname):
+    """The 4 bytes immediately before a function's entry == its kCFI type id.
+
+    The kernel reaches mod->init / mod->exit through function pointers, so at
+    those call sites it compares against exactly this word.  Read it from the
+    device's own working vendor module and you have ground truth for "this
+    module was built with kCFI" without relying on any heuristic.
+    """
+    with open(path, "rb") as f:
+        elf = ELFFile(f)
+        symtab = elf.get_section_by_name(".symtab")
+        if symtab is None:
+            return None
+        hit = None
+        for sym in symtab.iter_symbols():
+            if sym.name == fname and sym["st_shndx"] != "SHN_UNDEF":
+                hit = (sym["st_shndx"], sym["st_value"])
+                break
+        if hit is None:
+            return None
+        sec = elf.get_section(hit[0])
+        if sec is None or hit[1] < 4:
+            return None
+        f.seek(sec["sh_offset"] + (hit[1] - 4 - sec["sh_addr"]))
+        return int.from_bytes(f.read(4), "little")
+
+
 # ---------------------------------------------------------------- DWARF bits
 def dwarf_structs(path, wanted=None):
     out = {}
@@ -161,7 +231,7 @@ def main():
     ap.add_argument("--etm4x", action="store_true",
                     help="require the ETE/ETM DT match strings (coresight-etm4x.ko only)")
     ap.add_argument("--strict-cfi", action="store_true",
-                    help="treat 'no __kcfi_typeid_* symbols' as a hard failure")
+                    help="deprecated no-op: the kCFI checks are always enforced now")
     args = ap.parse_args()
 
     problems = []
@@ -172,17 +242,23 @@ def main():
     print(f"  this_module relocs: {mod_relocs}")
 
     # --- static checks that need no reference -------------------------------
-    with open(args.module, "rb") as f:
-        elf = ELFFile(f)
-        symtab = elf.get_section_by_name(".symtab")
-        names = {s.name for s in symtab.iter_symbols()}
-    cfi = sorted(n for n in names if n.startswith("__kcfi_typeid_"))
-    print(f"  kCFI typeids    : {len(cfi)}  {cfi[:3]}")
-    if not cfi:
-        msg = ("no __kcfi_typeid_* symbols: this module was NOT built with CONFIG_CFI_CLANG, "
-               "while the device kernel is kCFI (the kernel traps when it calls into the module "
-               "through a function pointer)")
-        (problems if args.strict_cfi else warnings_).append(msg)
+    blr, kcfi = kcfi_metrics(args.module)
+    mod_init_tid = typeid_prefix(args.module, "init_module")
+    mod_exit_tid = typeid_prefix(args.module, "cleanup_module")
+    print(f"  indirect calls (blr)  : {blr}")
+    print(f"  kCFI call-site checks : {kcfi}")
+    print(f"  init/exit type id     : "
+          f"{hex(mod_init_tid) if mod_init_tid is not None else None} / "
+          f"{hex(mod_exit_tid) if mod_exit_tid is not None else None}")
+    if blr and not kcfi:
+        problems.append(f"{blr} indirect call(s) but 0 kCFI checks: this module was NOT built "
+                        f"with CONFIG_CFI_CLANG; the device kernel (kCFI, CFI_PERMISSIVE unset) "
+                        f"panics on the first checked call into it")
+    elif blr and kcfi * 2 < blr:
+        warnings_.append(f"only {kcfi} kCFI checks for {blr} indirect calls - unexpected ratio")
+    if mod_init_tid is None:
+        problems.append("init_module has no room for a kCFI type-id prefix (or is missing); the "
+                        "kernel calls mod->init through a function pointer and will trap")
     with open(args.module, "rb") as f:
         data = f.read()
     if args.etm4x:
@@ -211,6 +287,25 @@ def main():
             if off in v_rel_by_off and v_rel_by_off[off] != sym:
                 problems.append(
                     f"offset 0x{off:x}: our {sym} collides with device kernel's {v_rel_by_off[off]}")
+
+        # kCFI: the type ids the kernel compares when it calls into the module.
+        # Both modules have the same function types for init/exit, so these words
+        # must be identical -- this is the direct evidence that the module was
+        # compiled with -fsanitize=kcfi, not an inference from symbol names.
+        v_init_tid = typeid_prefix(args.vendor, "init_module")
+        v_exit_tid = typeid_prefix(args.vendor, "cleanup_module")
+        print(f"  init/exit type id: "
+              f"{hex(v_init_tid) if v_init_tid is not None else None} / "
+              f"{hex(v_exit_tid) if v_exit_tid is not None else None}")
+        for label, mine, theirs in (("init_module", mod_init_tid, v_init_tid),
+                                    ("cleanup_module", mod_exit_tid, v_exit_tid)):
+            if theirs is None:
+                continue
+            if mine != theirs:
+                problems.append(
+                    f"{label} kCFI type id {hex(mine) if mine is not None else None} != device's "
+                    f"{hex(theirs)}: the kernel compares exactly this word when it calls into the "
+                    f"module, so a mismatch traps (CFI failure -> panic)")
 
     if args.btf:
         k = btf_structs(args.btf, None)
