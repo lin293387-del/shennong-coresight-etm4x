@@ -1,68 +1,57 @@
 #!/system/bin/sh
 #
-# Reaching this script proves that the previous boot completed, i.e. that the
-# coresight-etm4x.ko loaded by post-fs-data.sh did not break anything.  That is
-# the signal the watchdog in post-fs-data.sh waits for, so reset the counter
-# and write a one-shot capability report.
-#
+# CoreSight ETE loader for Xiaomi 14 Pro (shennong / SM8650) -- stage 2/3
+# ----------------------------------------------------------------------
+# Loads coresight-etm4x.ko in late_start service mode.  Memory only.
 
 MODDIR=${0%/*}
 STATE=/data/adb/coresight
 LOG=$STATE/coresight.log
-REPORT=$STATE/last-report.txt
+KO=$MODDIR/coresight-etm4x.ko
 
 mkdir -p "$STATE" 2>/dev/null
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$LOG" 2>/dev/null; }
 
-# give the rest of the boot a chance to settle before declaring success
-sleep 30
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$LOG" 2>/dev/null
-}
-
+# our own kill switch (set by the watchdog, or by hand)
 if [ -f "$STATE/DISABLE" ]; then
-    log "boot completed but DISABLE is set -> watchdog left alone"
+    log "DISABLE present -> not loading"
     exit 0
 fi
 
-echo 0 > "$STATE/attempts"
-log "boot completed -> watchdog counter reset to 0"
+# already in the kernel (e.g. action.sh loaded it) -> nothing to do
+if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
+    log "coresight_etm4x already loaded"
+    exit 0
+fi
 
-{
-    echo "generated : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "kernel    : $(uname -r)"
-    echo
+if [ ! -f "$KO" ]; then
+    log "ERROR: $KO missing"
+    exit 0
+fi
 
-    if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
-        echo "module    : LOADED"
-        grep '^coresight_etm4x ' /proc/modules
-    else
-        echo "module    : NOT LOADED"
-    fi
-    echo
+# full paths, so busybox standalone mode cannot shadow them
+INSMOD=/system/bin/insmod
+[ -x "$INSMOD" ] || INSMOD=insmod
 
-    echo "coresight-ete devices:"
-    ls -d /sys/bus/coresight/devices/coresight-ete* 2>/dev/null | sed 's|.*/|  |' || true
+# arm the watchdog *immediately* before the load: if the kernel dies here, the
+# marker survives and post-fs-data.sh on the next boot disables this module.
+: > "$STATE/armed"
+"$INSMOD" "$KO" >>"$LOG" 2>&1
+rc=$?
+rm -f "$STATE/armed"
 
-    echo
-    echo "platform devices:"
-    for d in /sys/bus/platform/devices/soc:ete*; do
-        [ -e "$d" ] || continue
-        printf '  %-16s driver=%s\n' "$(basename "$d")" \
-            "$(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null)"
-    done
+log "insmod rc=$rc"
+if [ "$rc" -ne 0 ]; then
+    log "load FAILED (cleanly - the kernel is fine). Typical causes: taint/vermagic/CRC/protected-symbol."
+    exit 0
+fi
 
-    echo
-    if [ -r /sys/bus/event_source/devices/cs_etm/cpus ]; then
-        echo "cs_etm cpus: $(cat /sys/bus/event_source/devices/cs_etm/cpus 2>/dev/null)"
-    else
-        echo "cs_etm cpus: (no cpus attribute -> no ETM/ETE source attached)"
-    fi
-    echo
-    echo "verdict: $([ -e /sys/bus/coresight/devices/coresight-ete0 ] \
-        && echo 'SUCCESS - ETE hardware accepted the driver' \
-        || echo 'FAILED - no ete device registered (driver absent, insmod failed, or hardware/TZ gate)')"
-} > "$REPORT" 2>&1
+# how many ETE sources did we get?
+n=0
+for d in /sys/bus/coresight/devices/coresight-ete*; do
+    [ -e "$d" ] || continue
+    n=$((n + 1))
+done
+log "coresight-ete devices registered: $n"
 
-log "report written to $REPORT"
 exit 0
