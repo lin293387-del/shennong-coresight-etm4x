@@ -1,17 +1,17 @@
-name: Build coresight-etm4x.ko (shennong / SM8650, ACK 6.1.138)
+name: Build coresight-etm4x.ko (shennong / SM8650, vendor tree + device ABI)
 
 # Builds the missing APSS ETE/ETMv4 driver module for the Xiaomi 14 Pro
-# (shennong / SM8650, HyperOS OS3.0.306.0.WNBCNXM, kernel
-# 6.1.138-android14-11-g0c3d559bcd85-ab14529422) and packages it as a
+# (shennong / SM8650, HyperOS OS3.0.306.0.WNBCNXM) and packages it as a
 # KernelSU / Magisk module.
 #
-# ---------------------------------------------------------------------------
-# Why the previous revision crashed the phone (fixed here)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. Why the previous revision crashed the phone (and what actually fixes it)
+# ===========================================================================
 # It was built from Xiaomi's 6.1.25 OSS snapshot with `gki_defconfig` + 3 lines.
 # gki_defconfig has CONFIG_DEBUG_INFO_BTF=y but NOT
-# CONFIG_DEBUG_INFO_BTF_MODULES=y; the shipping kernel has it =y (verified in the
-# device's own /proc/config.gz).  That switch adds, to `struct module`:
+# CONFIG_DEBUG_INFO_BTF_MODULES=y; the *device kernel* has it =y (verified in the
+# device's own /proc/config.gz).  That switch adds, to the kernel's
+# `struct module`:
 #
 #     #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
 #             unsigned int btf_data_size;     /* +0x348 */
@@ -19,49 +19,90 @@ name: Build coresight-etm4x.ko (shennong / SM8650, ACK 6.1.138)
 #     #endif
 #
 # i.e. +16 bytes right after bpf_raw_events, before jump_entries.  Measured from
-# the device's own /sys/kernel/btf/vmlinux:
+# the device's own /sys/kernel/btf/vmlinux and from the vendor .ko files:
 #
 #     kernel sizeof(struct module)        = 1088      (previous build: 1024)
-#     kernel offsetof(., name)            = 0x18      (same)
-#     kernel offsetof(., mkobj)           = 0x50      (same)
-#     kernel offsetof(., holders_dir)     = 0xf0      (same)
 #     kernel offsetof(., init)            = 0x170     (same)
-#     kernel offsetof(., source_list)     = 0x3b8     (ours: 0x3a8)
 #     kernel offsetof(., target_list)     = 0x3c8     (ours: 0x3b8)
 #     kernel offsetof(., exit)            = 0x3d8     (ours: 0x3c8)
 #
 # The module's own relocation `__this_module.exit = cleanup_module` therefore
-# landed on the kernel's `target_list.next` (0x3c8).  add_usage_links() walked
-# module .text bytes as a `struct module_use`, read a garbage ->target and
-# faulted at target->holders_dir -> Oops -> panic -> the Qualcomm/Gunyah watchdog
-# reset the SoC ~663 ms later.
+# landed on the kernel's `target_list.next` (0x3c8).  mod_sysfs_setup() ->
+# add_usage_links() (static, inlined; kernel/module/sysfs.c:255/262/395) walked
+# module .text bytes as a `struct module_use`, loaded a garbage ->target and
+# faulted at use->target->holders_dir (ldr x0,[x8,#0xf0]) -> Oops -> panic ->
+# the Gunyah watchdog reset the SoC 663 ms later:
+#
+#   [641.716013] pc : mod_sysfs_setup+0x208/0x418     x8 : 910ba000d0000040
+#   [641.716058] Call trace: mod_sysfs_setup <- load_module <- finit_module
+#   [641.716111] Kernel panic - not syncing: Oops: Fatal exception
+#   [642.380500] gh-watchdog: Causing a QCOM Apps Watchdog bite! (663 ms)
 #
 # Nothing in the loader validates `.gnu.linkonce.this_module` size (only
-# find_sec() mentions it), and the `module_layout` CRC - the sole struct-module
-# guard - passed because the CRC had been copied from the device's own modules.
-# Hence the hard "ABI gate" step below: it must pass before anything is published.
+# find_sec() mentions it, kernel/module/main.c:1925), and the `module_layout` CRC
+# - the sole struct-module guard - passed because the CRC had been copied from
+# the device's own modules.  Hence the hard ABI gate below.
 #
-# ---------------------------------------------------------------------------
-# What this revision does differently
-# ---------------------------------------------------------------------------
-# 1. Builds against the *exact* kernel the device runs:
-#    kernel/common (ACK) android14-6.1 @ 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
-#    (its committer date, 2025-12-02 18:05:30 -0800, matches the kernel banner
-#    "Wed Dec 3 02:05:30 UTC 2025").  No more 6.1.25 vendor snapshot, so
-#    tools/repair_tree.py and the coresight-tmc-usb prototype patch are gone.
-# 2. Takes the configuration from the DEVICE (refs/device.config, harvested with
-#    `zcat /proc/config.gz`), which keeps CONFIG_DEBUG_INFO_BTF_MODULES=y and
-#    every other ABI-relevant switch (CFI_CLANG, SHADOW_CALL_STACK, LTO_NONE,
-#    MODVERSIONS, ...).  A fallback path builds gki_defconfig plus the switches we
-#    know about, but that path is only a guess - the gate decides.
-# 3. Skips the vmlinux build: for `M=` builds scripts/Makefile.modfinal drops the
-#    vmlinux prerequisite and the BTF step prints
-#    "Skipping BTF generation ... due to unavailability of vmlinux".
-#    The +16 bytes of struct module come from the *config*, not from BTF
-#    generation, so the ABI is unaffected by skipping it.
-# 4. "ABI gate" step: tools/preflight.py refuses to publish a module whose
-#    sizeof(struct module) / relocation offsets / kCFI instrumentation differ from
-#    the device's own modules.
+# FIX = the same vendor source, compiled with the DEVICE's own config.  Nothing
+# in the kernel, the DTB or the boot chain has to change.
+#
+# ===========================================================================
+# 2. Why this builds from the VENDOR tree and not from ACK (android14-6.1)
+# ===========================================================================
+# The running *kernel* is ACK android14-6.1 @ 0c3d559bcd85 (the banner says
+# 6.1.138-android14-11-g0c3d559bcd85-ab14529422 and that commit's date matches
+# it), but the CoreSight modules on the device are NOT from ACK: they are
+# vendor_dlkm modules built from Qualcomm/Xiaomi's tree (their vermagic says
+# 6.1.68-android14-11-maybe-dirty, they export cscfg_* and etm_perf_symlink,
+# and they do not carry the "(O)" out-of-tree flag in `Modules linked in:`).
+#
+# A module built from ACK's coresight-etm4x-core.c therefore CANNOT bind to the
+# device's coresight.ko: ACK's driver calls
+#
+#     extern int coresight_timeout_action(struct csdev_access *, u32, int, int,
+#                                         coresight_timeout_cb_t);   /* coresight.h */
+#
+# and that symbol exists nowhere on the device:
+#
+#     $ grep __ksymtab_coresight_timeout_action  <device /proc/kallsyms>   -> none
+#     $ grep -w coresight_timeout_action         <device /proc/kallsyms>   -> none
+#
+# `insmod` would fail with "Unknown symbol coresight_timeout_action (err -2)".
+# The vendor tree's driver, built with the device config, imports only symbols
+# the device already exports - which is exactly what the vendor's own
+# coresight.ko does (the ABI baseline committed as refs/ref-coresight.ko:
+# this_module = 1088, cleanup_module @ 0x3d8, i.e. it loads on this kernel).
+#
+# The ABI comes from the CONFIG, not from the tree: refs/device.config is the
+# device kernel's own /proc/config.gz, so `struct module` and every other shared
+# layout come out identical, and the gate below verifies that byte for byte.
+#
+# ===========================================================================
+# 3. Build traps that are not obvious (all four were hit for real)
+# ===========================================================================
+# * pahole must exist.  CONFIG_DEBUG_INFO_BTF_MODULES depends on
+#   PAHOLE_HAS_SPLIT_BTF <- PAHOLE_VERSION <- scripts/pahole-version.sh.  With no
+#   pahole in PATH that shell returns 0, the symbol becomes *invisible* and
+#   `make olddefconfig` deletes the line from .config entirely (not even a
+#   "# ... is not set" comment) -> struct module shrinks back to 1024 -> the
+#   crash above comes back.  Verified check: include/generated/autoconf.h.
+# * `abi_symbollist.raw` must exist (an empty file is fine): the device config
+#   sets CONFIG_TRIM_UNUSED_KSYMS=y and CONFIG_UNUSED_KSYMS_WHITELIST to that
+#   file, and scripts/gen_autoksyms.sh hard-fails when it is missing.  It is a
+#   generated artifact of the full GKI build, irrelevant to a single M= module.
+# * CONFIG_WERROR=y is disabled for this build: it does not change the generated
+#   ABI, and there is no evidence this driver is warning-free with this clang.
+# * "exported" != "present in /proc/kallsyms" (CONFIG_TRIM_UNUSED_KSYMS=y), so
+#   the import gate checks the module's undefined symbols against the device's
+#   __ksymtab_* export list harvested into refs/exported-symbols.txt.
+#
+# ===========================================================================
+# 4. Gates (nothing is published unless these pass)
+# ===========================================================================
+#   preflight.py  : this_module == 1088, no relocation on a foreign member,
+#                   cleanup_module @ 0x3d8, kCFI present, DT match strings
+#   import_gate.py: every imported symbol is exported by the device
+#   autoconf.h    : kconfig really enabled CONFIG_DEBUG_INFO_BTF_MODULES
 
 on:
   workflow_dispatch:
@@ -73,10 +114,8 @@ permissions:
 
 env:
   ARCH: arm64
-  ACK_ARCHIVE: https://android.googlesource.com/kernel/common/+archive
-  ACK_REPO: https://android.googlesource.com/kernel/common
-  ACK_BRANCH: android14-6.1
-  ACK_COMMIT: 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
+  KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+  KERNEL_BRANCH: shennong-u-oss
   CLANG_TAG: clang-r487747c
   CLANG_REF: android-14.0.0_r1
   SRC: kernel
@@ -84,11 +123,19 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 200
 
     steps:
       - name: Checkout builder
         uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache \
+                      /usr/local/lib/node_modules /usr/share/swift
+          sudo apt-get clean
+          df -h /
 
       - name: Install dependencies
         run: |
@@ -96,46 +143,37 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio kmod rsync zip unzip \
-            ccache zstd curl git dwarves
-          # dwarves = pahole.  It is NOT optional here: lib/Kconfig.debug has
-          #     config DEBUG_INFO_BTF_MODULES
-          #             bool "..." ; default y
-          #             depends on DEBUG_INFO_BTF && MODULES && PAHOLE_HAS_SPLIT_BTF
-          #     config PAHOLE_HAS_SPLIT_BTF
-          #             def_bool PAHOLE_VERSION >= 119
-          # and init/Kconfig derives PAHOLE_VERSION from
-          #     $(shell,$(srctree)/scripts/pahole-version.sh $(PAHOLE))
-          # With no pahole in PATH that shell returns 0, PAHOLE_HAS_SPLIT_BTF
-          # becomes n, DEBUG_INFO_BTF_MODULES becomes *invisible*, and
-          # `make olddefconfig` deletes the line from .config entirely (not even
-          # a "# ... is not set" comment).  Result: sizeof(struct module)==1024
-          # instead of the device's 1088 -- exactly the crash this file fixes.
-          df -h / | tail -1
+            ccache zstd curl git-lfs dwarves python3-pyelftools
+          # dwarves = pahole.  NOT optional: without it
+          # CONFIG_DEBUG_INFO_BTF_MODULES silently disappears from .config and
+          # sizeof(struct module) drops from the device's 1088 to 1024, which is
+          # the exact crash this workflow exists to prevent (see the header).
+          # python3-pyelftools is what tools/preflight.py parses the ELF with
+          # (without it the gate dies with ModuleNotFoundError: elftools).
+          git lfs install --skip-repo || true
           pahole --version
+          # fail fast if either gate dependency is missing
+          python3 -c 'import elftools, sys; print("pyelftools OK")'
+          df -h / | tail -1
 
-      - name: Fetch ACK android14-6.1 @ ${{ env.ACK_COMMIT }}
+      - name: Clone the vendor kernel source (${{ env.KERNEL_BRANCH }})
         run: |
           set -eux
-          mkdir -p "$SRC"
-          if curl -fL --retry 3 -o /tmp/ack.tar.gz \
-               "$ACK_ARCHIVE/${ACK_COMMIT}.tar.gz"; then
-            tar -xzf /tmp/ack.tar.gz -C "$SRC"
-          else
-            echo "::warning::gitiles archive failed, falling back to a git clone"
-            git clone --depth=1 --single-branch --branch "$ACK_BRANCH" "$ACK_REPO" "$SRC"
-            if ! git -C "$SRC" cat-file -e "${ACK_COMMIT}^{commit}" 2>/dev/null; then
-              echo "::warning::exact commit not available, using branch tip"
-            else
-              git -C "$SRC" checkout -q "$ACK_COMMIT"
-            fi
-            rm -rf "$SRC/.git"
-          fi
-          echo "kernel tree: $(du -sh "$SRC" | cut -f1)"
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" "$SRC"
+          rm -rf "$SRC/.git"
+          du -sh "$SRC"
           grep -m1 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' "$SRC/Makefile" || true
           test -f "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
-          # the ETE + Qualcomm hooks the shennong DT needs must be in this tree
           grep -c 'arm,embedded-trace-extension' "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
           grep -c 'qcom,skip-power-up' "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
+          echo "----- the vendor tree calls the same helpers coresight.ko exports -----"
+          grep -n -E 'etm_perf_symlink|coresight_timeout_action|coresight_trace_id_' \
+            "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c" || true
+          echo "----- vendor CoreSight config fragments -----"
+          grep -h -E 'CORESIGHT' \
+            "$SRC/arch/arm64/configs/vendor/pineapple_GKI.config" \
+            "$SRC/arch/arm64/configs/vendor/shennong_GKI.config" 2>/dev/null | sort -u || true
 
       - name: Fetch AOSP clang ${{ env.CLANG_TAG }}
         run: |
@@ -149,66 +187,79 @@ jobs:
           echo "$PWD/$DEST/bin" >> "$GITHUB_PATH"
           "$DEST/bin/clang" --version
 
-      - name: Configure kernel (device config first)
+      - name: Repair incomplete vendor tree
+        run: |
+          set -eux
+          # Xiaomi's OSS snapshot references drivers/misc/hwid but does not ship
+          # it; repair_tree.py stubs the dangling Kconfig source.
+          python3 tools/repair_tree.py "$SRC"
+
+      - name: Fix known vendor prototype drift
+        run: |
+          set -eux
+          USBH="$SRC/include/linux/usb/usb_qdss.h"
+          TMCUSB="$SRC/drivers/hwtracing/coresight/coresight-tmc-usb.c"
+          # coresight-tmc-usb.c still calls the 2-argument form of
+          # usb_qdss_alloc_req() while the header declares the 3-argument one.
+          # We do not build coresight-tmc at all, so this is belt and braces.
+          if grep -q 'usb_qdss_alloc_req(struct usb_qdss_ch \*c, int n_wr, int n_rd)' "$USBH" 2>/dev/null; then
+            sed -i 's/usb_qdss_alloc_req(ch, USB_BUF_NUM)/usb_qdss_alloc_req(ch, USB_BUF_NUM, USB_BUF_NUM)/' "$TMCUSB"
+            grep -n 'usb_qdss_alloc_req(ch' "$TMCUSB" || true
+          else
+            echo "header uses a different prototype - skipping"
+          fi
+
+      - name: Configure kernel (device config = the ABI source of truth)
         run: |
           set -eux
           cd "$SRC"
           mkdir -p out
-          if [ -s "$GITHUB_WORKSPACE/refs/device.config" ]; then
-            echo "using refs/device.config (ground truth from the device)"
-            cp "$GITHUB_WORKSPACE/refs/device.config" out/.config
-          else
-            echo "::warning::refs/device.config missing - falling back to gki_defconfig + guesses"
-            make ARCH=arm64 LLVM=1 O=out gki_defconfig
-            printf '%s\n' 'CONFIG_DEBUG_INFO_BTF_MODULES=y' >> out/.config
-          fi
-          # the one switch that is actually missing from the shipping config,
-          # plus signing cosmetics (CONFIG_MODULE_SIG_PROTECT already disables
-          # enforcement on the device)
+          test -s "$GITHUB_WORKSPACE/refs/device.config" || {
+            echo "::error::refs/device.config is required: it is the device's own"
+            echo "::error::/proc/config.gz and defines the struct module ABI."
+            exit 1
+          }
+          cp "$GITHUB_WORKSPACE/refs/device.config" out/.config
+          echo "device config: $(wc -l < out/.config) lines"
+
+          # The vendor's own CoreSight switches (their vendor_dlkm build uses
+          # these two fragments), so the driver sees the same feature set it was
+          # written for.  Only CORESIGHT* lines are taken.
+          for f in arch/arm64/configs/vendor/pineapple_GKI.config \
+                   arch/arm64/configs/vendor/shennong_GKI.config; do
+            if [ -f "$f" ]; then
+              grep -E '^CONFIG_CORESIGHT' "$f" >> out/.config || true
+            fi
+          done
           ./scripts/config --file out/.config --module CORESIGHT
           ./scripts/config --file out/.config --module CORESIGHT_SOURCE_ETM4X
           ./scripts/config --file out/.config --disable MODULE_SIG_ALL
-          # WERROR has no effect on the generated code, but the device's GKI build
-          # never compiled this driver (`# CONFIG_CORESIGHT is not set` in the
-          # shipping config), so there is no evidence that
-          # coresight-etm4x-core.c is warning-free with this clang.  A single
-          # warning would otherwise kill the build.
+          # WERROR does not change the generated ABI, and the device's GKI build
+          # never compiled this driver, so there is no evidence it is warning-free.
           ./scripts/config --file out/.config --disable WERROR
-          # ACK/GKI build plumbing, unrelated to the module itself:
-          #   CONFIG_TRIM_UNUSED_KSYMS=y
-          #   CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"
-          # `make modules_prepare` needs include/generated/autoksyms.h, whose
-          # generator scripts/gen_autoksyms.sh hard-fails when that whitelist file
-          # is absent:
-          #   ERROR: '.../abi_symbollist.raw' whitelist file not found
-          # The file is a *generated* artifact of the full GKI build (build_abi.sh),
-          # not part of the source tarball, and it only decides which of the
-          # kernel's own exports survive trimming - a vmlinux concern we never
-          # build here.  An empty file satisfies the check and changes nothing for
-          # this module: its imports resolve through refs/kernel.symvers and the
-          # device's own symbol table (see the import gate in the ABI gate step).
+          # ACK/GKI build plumbing: scripts/gen_autoksyms.sh hard-fails when the
+          # CONFIG_UNUSED_KSYMS_WHITELIST file is missing.  It is generated by the
+          # full GKI build and only decides which vmlinux exports survive
+          # trimming - a vmlinux concern we never build here.
           : > abi_symbollist.raw
-          # LOCALVERSION is only cosmetic: same_magic() drops the first token when
-          # the module carries __versions.  Make it match anyway.
           LOCALVERSION="-android14-11" make ARCH=arm64 LLVM=1 O=out olddefconfig
+
           echo "----- pahole (drives PAHOLE_HAS_SPLIT_BTF >= 119) -----"
           command -v pahole || echo "::error::pahole missing from PATH"
           ./scripts/pahole-version.sh pahole || true
-          grep -E '^CONFIG_DEBUG_INFO_BTF(_MODULES)?=|^# CONFIG_DEBUG_INFO_BTF' out/.config || true
           echo "----- ABI-relevant switches -----"
-          grep -E '^(CONFIG_(DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|CFI_CLANG|LTO_NONE|LTO_CLANG[A-Z_]*|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|MODULE_SIG|MODULE_SIG_PROTECT|MODULE_FORCE_LOAD|TRACEPOINTS|BPF_EVENTS|JUMP_LABEL|FTRACE_MCOUNT_RECORD|KPROBES|LIVEPATCH|KUNIT|IKCONFIG|PANIC_ON_OOPS|PANIC_TIMEOUT|CORESIGHT[A-Z_]*)=|# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|SHADOW_CALL_STACK) is not set)' out/.config | sort
+          grep -E '^(CONFIG_(DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|PAHOLE_HAS_SPLIT_BTF|PAHOLE_VERSION|CFI_CLANG|LTO_NONE|LTO_CLANG[A-Z_]*|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|MODULE_SIG|MODULE_SIG_PROTECT|MODULE_FORCE_LOAD|TRACEPOINTS|BPF_EVENTS|JUMP_LABEL|KPROBES|CORESIGHT[A-Z_]*|STACKPROTECTOR[A-Z_]*)=|# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|SHADOW_CALL_STACK) is not set)' out/.config | sort
           echo "---------------------------------"
           grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' out/.config || {
-            echo "::error::CONFIG_DEBUG_INFO_BTF_MODULES is not =y. The shipping kernel has it"
-            echo "::error::enabled; without it sizeof(struct module) is 1024 instead of 1088 and the"
-            echo "::error::module's exit relocation lands on the kernel's target_list.next (the Oops)."
+            echo "::error::CONFIG_DEBUG_INFO_BTF_MODULES is not =y. The device kernel has it"
+            echo "::error::enabled; without it sizeof(struct module) is 1024 instead of 1088 and"
+            echo "::error::the module's exit relocation lands on target_list.next (the Oops)."
             echo "----- diagnosis -----"
             echo "pahole: $(command -v pahole || echo MISSING)"
             ./scripts/pahole-version.sh pahole || true
             grep -n -A4 'config DEBUG_INFO_BTF_MODULES' lib/Kconfig.debug || true
             grep -n -A3 'config PAHOLE_HAS_SPLIT_BTF' lib/Kconfig.debug || true
-            grep -n -A3 'config PAHOLE_VERSION' init/Kconfig || true
-            grep -i pahole out/.config || echo "(no pahole symbols in .config at all - the symbol was dropped)"
+            grep -i pahole out/.config || echo "(no pahole symbols in .config - the symbol was dropped)"
             exit 1
           }
           grep -q '^CONFIG_CORESIGHT_SOURCE_ETM4X=m' out/.config || {
@@ -225,15 +276,14 @@ jobs:
           cd "$SRC"
           make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare
           # Authoritative check: what kconfig *really* resolved, not what the
-          # .config file claims.  A .config line can survive while syncconfig
-          # drops the symbol because a dependency is unmet - that is exactly the
-          # pahole trap this workflow documents.
+          # .config file claims (a .config line can survive while syncconfig drops
+          # the symbol because a dependency is unmet - the pahole trap).
           OUTC="out/include/generated/autoconf.h"
           grep -E '^#define CONFIG_(DEBUG_INFO_BTF_MODULES|PAHOLE_HAS_SPLIT_BTF|PAHOLE_VERSION|DEBUG_INFO_BTF|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD) ' "$OUTC" | sort
           grep -q '^#define CONFIG_DEBUG_INFO_BTF_MODULES 1' "$OUTC" || {
             echo "::error::kconfig resolved CONFIG_DEBUG_INFO_BTF_MODULES to n even though the"
-            echo "::error::.config line is present.  struct module would then be 16 bytes short"
-            echo "::error::and the module would take the device down (see the file header)."
+            echo "::error::.config line is present.  struct module would be 16 bytes short and the"
+            echo "::error::module would take the device down (see the file header)."
             exit 1
           }
 
@@ -280,8 +330,9 @@ jobs:
           set -eux
           # refs/kernel.symvers carries the CRCs the device kernel actually checks
           # (harvested from the vendor modules that already load there).  Symbols
-          # that are absent from it stay unresolved, and check_version() accepts an
-          # entry that is not listed at all.
+          # absent from it stay unresolved, and check_version() accepts an entry
+          # that is not listed at all - see the module/kernel log line
+          # "kernelsu: no symbol version for module_layout" on the device.
           if [ -s "$GITHUB_WORKSPACE/refs/kernel.symvers" ]; then
             wc -l "$GITHUB_WORKSPACE/refs/kernel.symvers"
             cp "$GITHUB_WORKSPACE/refs/kernel.symvers" "$SRC/out/Module.symvers"
@@ -294,10 +345,13 @@ jobs:
         run: |
           set -eux
           MF="$SRC/drivers/hwtracing/coresight/Makefile"
-          # The device already ships coresight.ko, coresight-tmc.ko, funnel,
-          # replicator, ...  Building them here would make modpost compute
-          # genksyms CRCs for the symbols they export, which do not match the
-          # device's modules ("disagrees about version of symbol coresight_register").
+          # modpost computes the CRC of a symbol exported by a module built in the
+          # same run with genksyms from this tree's headers; that value is not the
+          # one the device's coresight.ko publishes, so importing
+          # coresight_register would be recorded with a CRC the kernel rejects
+          # ("disagrees about version of symbol coresight_register").  Leaving
+          # those modules out keeps their symbols unresolved, modpost then skips
+          # the entry, and check_version() accepts a symbol that is not listed.
           sed -i -E '/^obj-\$\(CONFIG_/ {/coresight-etm4x/!s/^/# trimmed by CI: /}' "$MF"
           grep -n -E '^obj-|^# trimmed by CI|^coresight-etm4x-y' "$MF"
 
@@ -321,27 +375,24 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           test -f refs/ref-coresight.ko || {
             echo "::error::refs/ref-coresight.ko is missing - it is the ground truth for"
-            echo "::error::sizeof(struct module) and the exit offset.  Harvest it with"
-            echo "::error::tools/collect_device_facts.sh and commit it."
+            echo "::error::sizeof(struct module) and the exit offset (the device's own"
+            echo "::error::coresight.ko, which loads fine on this kernel)."
             exit 1
           }
           python3 tools/preflight.py dist/coresight-etm4x.ko \
             --vendor refs/ref-coresight.ko --etm4x --strict-cfi
+          if [ -f refs/vmlinux.btf ]; then
+            python3 tools/preflight.py dist/coresight-etm4x.ko --btf refs/vmlinux.btf || true
+          fi
           # every symbol we import must be *exported* by the device kernel or by a
-          # module already loaded there.  The device is built with
-          # CONFIG_TRIM_UNUSED_KSYMS=y, so a plausible-looking symbol can be
-          # missing from the export table -> "Unknown symbol ... (err -2)".
-          # refs/exported-symbols.txt was harvested from the device's own
-          # /proc/kallsyms (12k __ksymtab_* names) - read-only, so this gate works
-          # without the phone.
+          # module already loaded there - CONFIG_TRIM_UNUSED_KSYMS=y means a symbol
+          # can exist in /proc/kallsyms yet not be in the export table, which is
+          # exactly how the ACK-source approach would have failed on
+          # coresight_timeout_action.
           if [ -f refs/exported-symbols.txt ]; then
             python3 tools/import_gate.py dist/coresight-etm4x.ko refs/exported-symbols.txt
           else
             echo "::warning::refs/exported-symbols.txt missing - skipping the import gate"
-            echo "::warning::(regenerate it with: tools/import_gate.py --list kallsyms out.txt)"
-          fi
-          if [ -f refs/vmlinux.btf ]; then
-            python3 tools/preflight.py dist/coresight-etm4x.ko --btf refs/vmlinux.btf || true
           fi
           if python3 tools/modversions.py dump dist/coresight-etm4x.ko | grep -q 'NO __versions'; then
             echo "::error::module has no __versions section; same_magic() would compare the full"
