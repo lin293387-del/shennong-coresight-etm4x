@@ -159,7 +159,8 @@ that produced the shipping build:
 | `vermagic` | `6.1.25-g1c27eb534afc SMP preempt mod_unload modversions aarch64` | `6.1.138-android14-11-g0c3d559bcd85-ab14529422 SMP preempt mod_unload modversions aarch64` | **OK** — `same_magic()` drops the first token when `__versions` exists, leaving an identical ` SMP preempt mod_unload modversions aarch64` |
 | `__versions` section | present; entries carry the exact CRC this kernel publishes; module-exported symbols are omitted rather than guessed | exact-CRC check, absent entries accepted | **OK** — see `tools/collect_crcs.py` |
 | signature | unsigned | `CONFIG_MODULE_SIG_PROTECT=y` | **OK** — that option forces `sig_enforce = false` |
-| CFI / LTO mode | `LTO_NONE` + `CFI_CLANG` + `SHADOW_CALL_STACK`, clang 17.0.2 r487747c | identical | **OK** |
+| CFI / LTO mode | `LTO_NONE` + `CFI_CLANG` + `SHADOW_CALL_STACK`, clang 17.0.2 r487747c | the device kernel is kCFI, the **old** build had zero `__kcfi_typeid_*` symbols | **ENFORCED** - must match; checked by `tools/preflight.py --strict-cfi` |
+| `sizeof(struct module)` / `.gnu.linkonce.this_module` | 1088 B, `exit`@0x3d8 | 1088 B, `exit`@0x3d8 (from `/sys/kernel/btf/vmlinux`) | **OK** - this is the mismatch that crashed the phone; enforced by `tools/preflight.py` |
 | DT match table | `arm,embedded-trace-extension`, `qcom,skip-power-up` present in the object | DT has `ete0..7` with exactly those properties | **OK** |
 | imported symbols | 61 undefined symbols, 9 of them `coresight_*` | all 61 present in `/proc/kallsyms`, including every `coresight_*` | **OK** |
 
@@ -217,3 +218,52 @@ booting) skips all module scripts entirely. The boot-attempt watchdog in
 `post-fs-data.sh` already disables the module by itself after three boots that
 never reach `service.sh`.
 
+## ABI gate, and why the old build crashed the phone
+
+The module this repository used to produce passed every check it looked at
+(vermagic, `__versions`, signature, symbols) and still took the phone down,
+because a module can also be built against a *different* `struct module` than the
+running kernel:
+
+```
+device kernel (from /sys/kernel/btf/vmlinux)     old cs.ko (gki_defconfig + 3 lines)
+    sizeof(struct module)            = 1088          1024
+    offsetof(module, name)           = 0x18          0x18
+    offsetof(module, holders_dir)    = 0xf0          0xf0
+    offsetof(module, init)           = 0x170         0x170
+    offsetof(module, source_list)    = 0x3b8         0x3a8
+    offsetof(module, target_list)    = 0x3c8         0x3b8
+    offsetof(module, exit)           = 0x3d8         0x3c8   <-- collision
+```
+
+The 16 missing bytes are `btf_data_size`/`btf_data` at 0x348/0x350, present only
+with `CONFIG_DEBUG_INFO_BTF_MODULES=y`.  So the module's own relocation
+`__this_module.exit = cleanup_module` was written at 0x3c8 - exactly where the
+kernel keeps `target_list.next`.  `add_usage_links()` then treated module `.text`
+as a `struct module_use`, read a garbage `use->target` and faulted on
+`use->target->holders_dir`; the Oops became a panic and the Qualcomm/Gunyah
+watchdog reset the SoC about 663 ms later.
+
+Nothing in the loader validates the `.gnu.linkonce.this_module` size, and the
+`module_layout` CRC - the only struct-module guard - passed because the CRC had
+been copied from the device's own modules.  Therefore this repository now:
+
+* takes its configuration from the device itself (`refs/device.config`, harvested
+  with `tools/collect_device_facts.sh`) instead of `gki_defconfig`;
+* builds against the exact kernel the device runs (kernel/common `android14-6.1`
+  @ `0c3d559bcd85`, i.e. `6.1.138-android14-11-g0c3d559bcd85-ab14529422`), so the
+  vendor-tree repairs (`repair_tree.py`, the coresight-tmc-usb patch) are gone;
+* runs `tools/preflight.py` as a release gate that must pass: `this_module`
+  = 1088, `cleanup_module` relocated at 0x3d8, `__kcfi_typeid_*` present, ETE DT
+  match strings present, and (with `--btf`) a per-member comparison against the
+  kernel's own BTF.
+
+Refresh the reference data at any time with:
+
+```
+adb push tools/collect_device_facts.sh /data/local/tmp/
+adb shell "su -c 'sh /data/local/tmp/collect_device_facts.sh'"
+adb pull /data/local/tmp/coresight-facts /tmp/facts
+cp /tmp/facts/device.config refs/device.config
+cp /tmp/facts/refs/coresight.ko refs/ref-coresight.ko
+```
