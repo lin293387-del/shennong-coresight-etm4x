@@ -380,6 +380,22 @@ jobs:
           echo "----- __versions -----"
           python3 "$GITHUB_WORKSPACE/tools/modversions.py" dump "$KO" | head -25
 
+          # Definitive proof of whether kCFI was really applied to this object:
+          # kbuild records the exact compiler command line in .<obj>.cmd, so grep
+          # that instead of inferring it from symbol names (which is what made the
+          # gate red: `__kcfi_typeid_*` is only emitted for functions that are
+          # *declared but not defined* in the unit, so a fully kCFI-instrumented
+          # module can legitimately have zero of them).
+          echo "----- the ACTUAL compiler command line (kbuild .cmd file) -----"
+          for CMD in out/drivers/hwtracing/coresight/.coresight-etm4x*.o.cmd; do
+            [ -f "$CMD" ] || continue
+            echo "== $CMD"
+            tr ' ' '\n' < "$CMD" | grep -E -- '-(fsanitize|mbranch-protection|fpatchable|fno-sanitize|mgeneral)' | sort -u || true
+          done
+          echo "----- kCFI metrics measured from the built .ko -----"
+          python3 "$GITHUB_WORKSPACE/tools/preflight.py" dist/coresight-etm4x.ko 2>&1 \
+            | grep -E 'indirect calls|kCFI call|type id' || true
+
       - name: ABI gate (must pass before anything is published)
         run: |
           set -eux
