@@ -138,6 +138,48 @@ jobs:
           echo "================= perf report --stats ================="
           $PERF report --stdio -i inj.data --stats 2>&1 | head -30
 
+      - name: Probe perf.data compatibility with upstream perf
+        run: |
+          set +e
+          PERF=./linux-6.1/tools/perf/perf
+          echo "########## meta-fixed.data (trace IDs corrected) ##########"
+          timeout 300 $PERF report --stdio -i "$ASSET" -v > probe.txt 2>&1
+          echo "exit=$?"
+          head -40 probe.txt
+          echo "########## meta.data (as captured) ##########"
+          curl -fsSL --retry 3 -o meta.data \
+            "https://github.com/lin293387-del/shennong-coresight-etm4x/releases/download/trace-v1/meta.data"
+          timeout 300 $PERF report --stdio -i meta.data -v 2>&1 | head -20
+          echo "NAKED=" > perf_probe.txt
+          cat probe.txt >> perf_probe.txt
+
+      - name: Decode with AOSP simpleperf (Linux host) -- the tool that wrote the file
+        run: |
+          set +e
+          curl -fsSL --retry 3 -o simpleperf.b64 \
+            'https://android.googlesource.com/platform/prebuilts/simpleperf/+/refs/heads/master/bin/linux/x86_64/simpleperf?format=TEXT'
+          base64 -d simpleperf.b64 > simpleperf
+          chmod +x simpleperf
+          ./simpleperf --version
+          {
+            for f in "$ASSET" meta.data; do
+              echo "################ ${f} ################"
+              ls -l "$f"
+              echo "--- dump (metadata) ---"
+              ./simpleperf dump -i "$f" 2>&1 | head -25
+              echo "--- inject: branch-list ---"
+              rm -f "branch_${f}"
+              ./simpleperf inject -i "$f" --output branch-list -o "branch_${f}" 2>&1 | tail -25
+              ls -l "branch_${f}" 2>/dev/null || echo "(no branch list produced)"
+              echo "--- inject: autofdo ---"
+              rm -f "afdo_${f}"
+              ./simpleperf inject -i "$f" --output autofdo -o "afdo_${f}" 2>&1 | tail -25
+              ls -l "afdo_${f}" 2>/dev/null || echo "(no autofdo produced)"
+              echo "--- report ---"
+              ./simpleperf report -i "$f" 2>&1 | head -20
+            done
+          } | tee simpleperf-decode.txt
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,8 +187,14 @@ jobs:
           name: decode-results
           path: |
             dump-head.txt
+            simpleperf-decode.txt
+            perf_probe.txt
             inject.log
             inj.data
             build-options.txt
+            branch_meta-fixed.data
+            afdo_meta-fixed.data
+            branch_meta.data
+            afdo_meta.data
           if-no-files-found: warn
           retention-days: 14
