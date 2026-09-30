@@ -22,6 +22,9 @@ LOG=$STATE/coresight.log
 mkdir -p "$STATE" 2>/dev/null
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [action] $*" >> "$LOG" 2>/dev/null; }
 
+ABI_CONFIG_RE='^CONFIG_(DEBUG_INFO_BTF_MODULES|DEBUG_INFO_BTF|CFI_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|PREEMPT|BPF_EVENTS|JUMP_LABEL|KPROBES|KUNIT|TRACEPOINTS|MODULE_SIG_PROTECT|TRIM_UNUSED_KSYMS)=|^# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|PREEMPT|BPF_EVENTS|JUMP_LABEL) '
+abi_hash() { zcat /proc/config.gz 2>/dev/null | grep -E "$ABI_CONFIG_RE" | sort | sha256sum | cut -d' ' -f1; }
+
 if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
     # ---- currently loaded -> unload, i.e. restore stock state -------------
     RMMOD=/system/bin/rmmod
@@ -39,22 +42,31 @@ else
     # Same guard as service.sh: never load a .ko whose kernel has moved.
     WANT=$(cat "$VERFILE" 2>/dev/null)
     HAVE=$(uname -r)
-    if [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ]; then
-        log "action: refusing to load, kernel changed ('$WANT' -> '$HAVE')"
+    WANT_ABI=$(cat "$MODDIR/verified-abihash" 2>/dev/null)
+    HAVE_ABI=$(abi_hash)
+    REASON=""
+    [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && REASON="uname -r moved ('$WANT' -> '$HAVE')"
+    if [ -z "$REASON" ] && [ -n "$WANT_ABI" ] && [ "$WANT_ABI" != "$HAVE_ABI" ]; then
+        REASON="ABI config switches changed"
+    fi
+    if [ -n "$REASON" ]; then
+        log "action: refusing to load, $REASON"
         echo "REFUSING TO LOAD."
-        echo "  this .ko was verified for : $WANT"
-        echo "  the running kernel is     : $HAVE"
+        echo "  reason                    : $REASON"
+        echo "  this .ko was verified for : $WANT  (abi ${WANT_ABI:-none})"
+        echo "  the running kernel is     : $HAVE  (abi $HAVE_ABI)"
         echo
         echo "The module is ABI- and CRC-matched to one kernel build.  If the"
-        echo "kernel changed (system update), loading the old .ko can panic the"
-        echo "module loader -- so we do nothing until it is re-verified."
+        echo "kernel or its ABI switches changed (system update), loading the old"
+        echo ".ko can panic the module loader -- so we do nothing until re-verified."
         echo
         echo "To re-enable:"
         echo "  1. run the offline gate against the new device facts:"
         echo "       python tools/preflight.py <new.ko> --vendor refs/ref-coresight.ko --etm4x"
         echo "       python tools/preflight.py <new.ko> --btf refs/vmlinux.btf"
-        echo "  2. if it is green, write the new version in and reboot:"
+        echo "  2. if it is green, re-pin and reboot:"
         echo "       echo \"$HAVE\" > $VERFILE"
+        echo "       echo \"$HAVE_ABI\" > $MODDIR/verified-abihash"
         exit 1
     fi
     if [ ! -f "$KO" ]; then
