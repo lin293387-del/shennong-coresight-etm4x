@@ -1,34 +1,67 @@
-name: Build coresight-etm4x.ko (shennong / SM8650)
+name: Build coresight-etm4x.ko (shennong / SM8650, ACK 6.1.138)
 
 # Builds the missing APSS ETE/ETMv4 driver module for the Xiaomi 14 Pro
-# (shennong / SM8650) from Xiaomi's own OSS source, then packages it as a
+# (shennong / SM8650, HyperOS OS3.0.306.0.WNBCNXM, kernel
+# 6.1.138-android14-11-g0c3d559bcd85-ab14529422) and packages it as a
 # KernelSU / Magisk module.
 #
-# See README.md for the full rationale; the short version:
+# ---------------------------------------------------------------------------
+# Why the previous revision crashed the phone (fixed here)
+# ---------------------------------------------------------------------------
+# It was built from Xiaomi's 6.1.25 OSS snapshot with `gki_defconfig` + 3 lines.
+# gki_defconfig has CONFIG_DEBUG_INFO_BTF=y but NOT
+# CONFIG_DEBUG_INFO_BTF_MODULES=y; the shipping kernel has it =y (verified in the
+# device's own /proc/config.gz).  That switch adds, to `struct module`:
 #
-#   * pineapple_GKI.config (the config that produced the shipped /vendor_dlkm)
-#     enables 13 CONFIG_CORESIGHT_* symbols but NOT
-#     CONFIG_CORESIGHT_SOURCE_ETM4X, which only appears in the internal debug
-#     variant pineapple_consolidate.config.  Hence the DT nodes ete0..7 have no
-#     driver and `cs_etm` ends up with zero CPUs.
+#     #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+#             unsigned int btf_data_size;     /* +0x348 */
+#             void *btf_data;                 /* +0x350 */
+#     #endif
 #
-#   * kernel/module/version.c :: same_magic() ignores the version prefix of the
-#     vermagic string when the module carries a __versions section, so a module
-#     built here loads on the 6.1.138 device kernel even though this tree is
-#     based on 6.1.25.
+# i.e. +16 bytes right after bpf_raw_events, before jump_entries.  Measured from
+# the device's own /sys/kernel/btf/vmlinux:
 #
-#   * kernel/module/version.c :: check_version() compares the recorded CRC of
-#     every imported symbol *exactly*, and only accepts a symbol that is not
-#     listed in __versions at all.  refs/kernel.symvers therefore carries the
-#     exact CRCs the device kernel publishes, harvested from the vendor modules
-#     that already load on it (tools/collect_crcs.py); anything modpost cannot
-#     resolve this way is skipped and accepted.
+#     kernel sizeof(struct module)        = 1088      (previous build: 1024)
+#     kernel offsetof(., name)            = 0x18      (same)
+#     kernel offsetof(., mkobj)           = 0x50      (same)
+#     kernel offsetof(., holders_dir)     = 0xf0      (same)
+#     kernel offsetof(., init)            = 0x170     (same)
+#     kernel offsetof(., source_list)     = 0x3b8     (ours: 0x3a8)
+#     kernel offsetof(., target_list)     = 0x3c8     (ours: 0x3b8)
+#     kernel offsetof(., exit)            = 0x3d8     (ours: 0x3c8)
 #
-#   * kernel/module/signing.c: with CONFIG_MODULE_SIG_PROTECT=y (device config)
-#     signature enforcement is off, so an unsigned module loads.
+# The module's own relocation `__this_module.exit = cleanup_module` therefore
+# landed on the kernel's `target_list.next` (0x3c8).  add_usage_links() walked
+# module .text bytes as a `struct module_use`, read a garbage ->target and
+# faulted at target->holders_dir -> Oops -> panic -> the Qualcomm/Gunyah watchdog
+# reset the SoC ~663 ms later.
 #
-# Xiaomi's OSS snapshot is incomplete (drivers/misc/hwid is referenced but not
-# shipped), which tools/repair_tree.py fixes by stubbing the dangling Kconfig.
+# Nothing in the loader validates `.gnu.linkonce.this_module` size (only
+# find_sec() mentions it), and the `module_layout` CRC - the sole struct-module
+# guard - passed because the CRC had been copied from the device's own modules.
+# Hence the hard "ABI gate" step below: it must pass before anything is published.
+#
+# ---------------------------------------------------------------------------
+# What this revision does differently
+# ---------------------------------------------------------------------------
+# 1. Builds against the *exact* kernel the device runs:
+#    kernel/common (ACK) android14-6.1 @ 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
+#    (its committer date, 2025-12-02 18:05:30 -0800, matches the kernel banner
+#    "Wed Dec 3 02:05:30 UTC 2025").  No more 6.1.25 vendor snapshot, so
+#    tools/repair_tree.py and the coresight-tmc-usb prototype patch are gone.
+# 2. Takes the configuration from the DEVICE (refs/device.config, harvested with
+#    `zcat /proc/config.gz`), which keeps CONFIG_DEBUG_INFO_BTF_MODULES=y and
+#    every other ABI-relevant switch (CFI_CLANG, SHADOW_CALL_STACK, LTO_NONE,
+#    MODVERSIONS, ...).  A fallback path builds gki_defconfig plus the switches we
+#    know about, but that path is only a guess - the gate decides.
+# 3. Skips the vmlinux build: for `M=` builds scripts/Makefile.modfinal drops the
+#    vmlinux prerequisite and the BTF step prints
+#    "Skipping BTF generation ... due to unavailability of vmlinux".
+#    The +16 bytes of struct module come from the *config*, not from BTF
+#    generation, so the ABI is unaffected by skipping it.
+# 4. "ABI gate" step: tools/preflight.py refuses to publish a module whose
+#    sizeof(struct module) / relocation offsets / kCFI instrumentation differ from
+#    the device's own modules.
 
 on:
   workflow_dispatch:
@@ -40,8 +73,10 @@ permissions:
 
 env:
   ARCH: arm64
-  KERNEL_REPO: https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
-  KERNEL_BRANCH: shennong-u-oss
+  ACK_ARCHIVE: https://android.googlesource.com/kernel/common/+archive
+  ACK_REPO: https://android.googlesource.com/kernel/common
+  ACK_BRANCH: android14-6.1
+  ACK_COMMIT: 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
   CLANG_TAG: clang-r487747c
   CLANG_REF: android-14.0.0_r1
   SRC: kernel
@@ -49,102 +84,95 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 200
+    timeout-minutes: 120
 
     steps:
       - name: Checkout builder
         uses: actions/checkout@v4
 
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache \
-                      /usr/local/lib/node_modules /usr/share/swift
-          sudo apt-get clean
-          df -h /
-
       - name: Install dependencies
         run: |
+          set -eux
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev cpio kmod rsync zip unzip \
-            ccache zstd curl git-lfs
-          git lfs install --skip-repo || true
+            ccache zstd curl git
+          df -h / | tail -1
 
-      - name: Clone Xiaomi kernel source (${{ env.KERNEL_BRANCH }})
+      - name: Fetch ACK android14-6.1 @ ${{ env.ACK_COMMIT }}
         run: |
-          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
-            "$KERNEL_REPO" "$SRC"
-          rm -rf "$SRC/.git"
-          du -sh "$SRC"
+          set -eux
+          mkdir -p "$SRC"
+          if curl -fL --retry 3 -o /tmp/ack.tar.gz \
+               "$ACK_ARCHIVE/${ACK_COMMIT}.tar.gz"; then
+            tar -xzf /tmp/ack.tar.gz -C "$SRC"
+          else
+            echo "::warning::gitiles archive failed, falling back to a git clone"
+            git clone --depth=1 --single-branch --branch "$ACK_BRANCH" "$ACK_REPO" "$SRC"
+            if ! git -C "$SRC" cat-file -e "${ACK_COMMIT}^{commit}" 2>/dev/null; then
+              echo "::warning::exact commit not available, using branch tip"
+            else
+              git -C "$SRC" checkout -q "$ACK_COMMIT"
+            fi
+            rm -rf "$SRC/.git"
+          fi
+          echo "kernel tree: $(du -sh "$SRC" | cut -f1)"
+          grep -m1 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' "$SRC/Makefile" || true
+          test -f "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
+          # the ETE + Qualcomm hooks the shennong DT needs must be in this tree
+          grep -c 'arm,embedded-trace-extension' "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
+          grep -c 'qcom,skip-power-up' "$SRC/drivers/hwtracing/coresight/coresight-etm4x-core.c"
 
       - name: Fetch AOSP clang ${{ env.CLANG_TAG }}
         run: |
+          set -eux
           DEST="prebuilts/clang/host/linux-x86/${CLANG_TAG}"
           mkdir -p "$DEST"
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_REF}/${CLANG_TAG}.tar.gz"
-          echo "downloading $URL"
           curl -fL --retry 3 -o /tmp/clang.tar.gz "$URL"
           tar -xzf /tmp/clang.tar.gz -C "$DEST"
           rm -f /tmp/clang.tar.gz
           echo "$PWD/$DEST/bin" >> "$GITHUB_PATH"
           "$DEST/bin/clang" --version
 
-      - name: Repair incomplete vendor tree
-        run: |
-          set -x
-          python3 tools/repair_tree.py "$SRC"
-
-      - name: Fix known vendor prototype drift
-        run: |
-          set -x
-          USBH="$SRC/include/linux/usb/usb_qdss.h"
-          TMCUSB="$SRC/drivers/hwtracing/coresight/coresight-tmc-usb.c"
-          # coresight-tmc-usb.c still calls the 2-argument form of
-          # usb_qdss_alloc_req() while the header in this snapshot declares the
-          # 3-argument one.  We do not build coresight-tmc at all (TMC is left
-          # out of the config fragment because CORESIGHT_SOURCE_ETM4X does not
-          # select it), so this is only a belt-and-braces fix in case a future
-          # config pulls the TMC driver back in.
-          if grep -q 'usb_qdss_alloc_req(struct usb_qdss_ch \*c, int n_wr, int n_rd)' "$USBH" 2>/dev/null; then
-            sed -i 's/usb_qdss_alloc_req(ch, USB_BUF_NUM)/usb_qdss_alloc_req(ch, USB_BUF_NUM, USB_BUF_NUM)/' "$TMCUSB"
-            grep -n 'usb_qdss_alloc_req(ch' "$TMCUSB" || true
-          else
-            echo "header uses a different prototype - skipping"
-          fi
-
-      - name: Configure kernel
+      - name: Configure kernel (device config first)
         run: |
           set -eux
           cd "$SRC"
-          make ARCH=arm64 LLVM=1 O=out gki_defconfig
-          printf '%s\n' \
-            'CONFIG_CORESIGHT=m' \
-            'CONFIG_CORESIGHT_SOURCE_ETM4X=m' \
-            'CONFIG_MODULE_SIG_ALL=n' >> out/.config
-          make ARCH=arm64 LLVM=1 O=out olddefconfig
-          echo "----- coresight / modversion config -----"
-          grep -E 'CORESIGHT|MODVERSIONS|MODULE_SIG|CFI_CLANG|^CONFIG_PREEMPT=|^CONFIG_SMP=|^CONFIG_MODULE_UNLOAD=' \
-            out/.config | sort
-          echo "-----------------------------------------"
-
-      - name: Build only the coresight-etm4x module
-        run: |
-          set -eux
-          MF="$SRC/drivers/hwtracing/coresight/Makefile"
-          # modpost computes the CRC of a symbol exported by a module built in
-          # the *same* run with genksyms from this tree's headers.  That value
-          # is not the one the device's coresight.ko publishes, so an import of
-          # coresight_register would be recorded with a CRC this kernel rejects
-          # ("disagrees about version of symbol coresight_register").
-          #
-          # Leaving those modules out of the build keeps their symbols
-          # unresolved, which makes modpost skip the entry entirely - and
-          # kernel/module/version.c accepts a symbol that is not listed in
-          # __versions.  Only the etm4x object is needed anyway: the device
-          # already ships coresight.ko, coresight-tmc.ko, funnel, replicator ...
-          sed -i -E '/^obj-\$\(CONFIG_/ {/coresight-etm4x/!s/^/# trimmed by CI: /}' "$MF"
-          grep -n -E '^obj-|^# trimmed by CI' "$MF"
+          mkdir -p out
+          if [ -s "$GITHUB_WORKSPACE/refs/device.config" ]; then
+            echo "using refs/device.config (ground truth from the device)"
+            cp "$GITHUB_WORKSPACE/refs/device.config" out/.config
+          else
+            echo "::warning::refs/device.config missing - falling back to gki_defconfig + guesses"
+            make ARCH=arm64 LLVM=1 O=out gki_defconfig
+            printf '%s\n' 'CONFIG_DEBUG_INFO_BTF_MODULES=y' >> out/.config
+          fi
+          # the one switch that is actually missing from the shipping config,
+          # plus signing cosmetics (CONFIG_MODULE_SIG_PROTECT already disables
+          # enforcement on the device)
+          ./scripts/config --file out/.config --module CORESIGHT
+          ./scripts/config --file out/.config --module CORESIGHT_SOURCE_ETM4X
+          ./scripts/config --file out/.config --disable MODULE_SIG_ALL
+          # LOCALVERSION is only cosmetic: same_magic() drops the first token when
+          # the module carries __versions.  Make it match anyway.
+          LOCALVERSION="-android14-11" make ARCH=arm64 LLVM=1 O=out olddefconfig
+          echo "----- ABI-relevant switches -----"
+          grep -E '^(CONFIG_(DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|CFI_CLANG|LTO_NONE|LTO_CLANG[A-Z_]*|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|MODULE_SIG|MODULE_SIG_PROTECT|MODULE_FORCE_LOAD|TRACEPOINTS|BPF_EVENTS|JUMP_LABEL|FTRACE_MCOUNT_RECORD|KPROBES|LIVEPATCH|KUNIT|IKCONFIG|PANIC_ON_OOPS|PANIC_TIMEOUT|CORESIGHT[A-Z_]*)=|# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|SHADOW_CALL_STACK) is not set)' out/.config | sort
+          echo "---------------------------------"
+          grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' out/.config || {
+            echo "::error::CONFIG_DEBUG_INFO_BTF_MODULES is not =y. The shipping kernel has it"
+            echo "::error::enabled; without it sizeof(struct module) is 1024 instead of 1088 and the"
+            echo "::error::module's exit relocation lands on the kernel's target_list.next (the Oops)."
+            exit 1
+          }
+          grep -q '^CONFIG_CORESIGHT_SOURCE_ETM4X=m' out/.config || {
+            echo "::error::CONFIG_CORESIGHT_SOURCE_ETM4X is not =m - nothing to build."; exit 1
+          }
+          grep -q '^CONFIG_CFI_CLANG=y' out/.config || {
+            echo "::error::CONFIG_CFI_CLANG is not =y but the device kernel is kCFI; the kernel"
+            echo "::error::would trap when calling into the module."; exit 1
+          }
 
       - name: Prepare build
         run: |
@@ -152,88 +180,74 @@ jobs:
           cd "$SRC"
           make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare
 
-      - name: Install harvested symbol CRCs
+      - name: Install the device's symbol CRCs
         run: |
           set -eux
-          # refs/kernel.symvers maps every vmlinux symbol this kernel publishes
-          # a CRC for to the exact value it checks against, harvested from the
-          # vendor modules that already load successfully on the device (see
-          # tools/collect_crcs.py).  Giving modpost this file means the entries
-          # it writes into __versions carry the right CRCs.
-          #
-          # Symbols that are *absent* from Module.symvers bring modpost to skip
-          # the entry entirely (its `if (!s->crc_valid) continue;` branch), and
-          # kernel/module/version.c accepts a symbol that is not listed at all -
-          # it only fails on a recorded CRC that differs.
-          wc -l refs/kernel.symvers
-          head -3 refs/kernel.symvers
-          cp refs/kernel.symvers "$SRC/out/Module.symvers"
-          ls -l "$SRC/out/Module.symvers"
+          # refs/kernel.symvers carries the CRCs the device kernel actually checks
+          # (harvested from the vendor modules that already load there).  Symbols
+          # that are absent from it stay unresolved, and check_version() accepts an
+          # entry that is not listed at all.
+          if [ -s "$GITHUB_WORKSPACE/refs/kernel.symvers" ]; then
+            wc -l "$GITHUB_WORKSPACE/refs/kernel.symvers"
+            cp "$GITHUB_WORKSPACE/refs/kernel.symvers" "$SRC/out/Module.symvers"
+          else
+            echo "::warning::refs/kernel.symvers missing - modpost will invent CRCs for"
+            echo "::warning::module-provided symbols; the device will reject those imports."
+          fi
 
-      - name: Build coresight modules
+      - name: Keep only the coresight-etm4x object
+        run: |
+          set -eux
+          MF="$SRC/drivers/hwtracing/coresight/Makefile"
+          # The device already ships coresight.ko, coresight-tmc.ko, funnel,
+          # replicator, ...  Building them here would make modpost compute
+          # genksyms CRCs for the symbols they export, which do not match the
+          # device's modules ("disagrees about version of symbol coresight_register").
+          sed -i -E '/^obj-\$\(CONFIG_/ {/coresight-etm4x/!s/^/# trimmed by CI: /}' "$MF"
+          grep -n -E '^obj-|^# trimmed by CI|^coresight-etm4x-y' "$MF"
+
+      - name: Build coresight-etm4x.ko
         run: |
           set -eux
           cd "$SRC"
-          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out \
-            -j"$(nproc)" M=drivers/hwtracing/coresight || \
-          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out \
+          KBUILD_MODPOST_WARN=1 make ARCH=arm64 LLVM=1 O=out LOCALVERSION="-android14-11" \
             -j"$(nproc)" M=drivers/hwtracing/coresight modules
-
-      - name: Locate and inspect the module
-        run: |
-          set -eux
-          cd "$SRC"
-          echo "----- every module that was built -----"
-          find . -name '*.ko' -printf '%p  %s bytes\n' | sort
-          KO=$(find . -name 'coresight-etm4x.ko' -print -quit)
+          KO=$(find out/drivers/hwtracing/coresight -name 'coresight-etm4x.ko' -print -quit)
           test -n "$KO"
-          echo "KO=$KO"
-          ls -l "$KO"
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp "$KO" "$GITHUB_WORKSPACE/dist/coresight-etm4x.ko"
-          echo "----- vermagic -----"
-          strings "$KO" | grep -i '^vermagic=' || true
+          cp "$KO" "$GITHUB_WORKSPACE/dist/coresight-etm4x.ko"     # keep DWARF for the gate
+          echo "----- vermagic -----"; strings "$KO" | grep -i '^vermagic=' || true
           echo "----- __versions -----"
-          python3 "$GITHUB_WORKSPACE/tools/modversions.py" dump \
-            "$GITHUB_WORKSPACE/dist/coresight-etm4x.ko" | head -25
-          echo "----- sections -----"
-          strings "$KO" | grep -iE 'coresight-etm4x|kcfi|__cfi' | head -10 || true
+          python3 "$GITHUB_WORKSPACE/tools/modversions.py" dump "$KO" | head -25
 
-      - name: Verify __versions looks sane
+      - name: ABI gate (must pass before anything is published)
         run: |
           set -eux
           cd "$GITHUB_WORKSPACE"
+          test -f refs/ref-coresight.ko || {
+            echo "::error::refs/ref-coresight.ko is missing - it is the ground truth for"
+            echo "::error::sizeof(struct module) and the exit offset.  Harvest it with"
+            echo "::error::tools/collect_device_facts.sh and commit it."
+            exit 1
+          }
+          python3 tools/preflight.py dist/coresight-etm4x.ko \
+            --vendor refs/ref-coresight.ko --etm4x --strict-cfi
+          if [ -f refs/vmlinux.btf ]; then
+            python3 tools/preflight.py dist/coresight-etm4x.ko --btf refs/vmlinux.btf || true
+          fi
           if python3 tools/modversions.py dump dist/coresight-etm4x.ko | grep -q 'NO __versions'; then
-            echo "::error::module has no __versions section; same_magic() would compare the full vermagic and the module would be rejected"
+            echo "::error::module has no __versions section; same_magic() would compare the full"
+            echo "::error::vermagic (release prefix included) and reject the module."
             exit 1
           fi
-          # Every recorded CRC must be non-zero: kernel/module/version.c compares
-          # them exactly, and a zero would only ever be accepted if the kernel
-          # itself happened to publish a zero CRC for that symbol.
-          python3 - <<'PY'
-          import importlib.util, sys
-          spec = importlib.util.spec_from_file_location(
-              "mv", "tools/modversions.py")
-          mv = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mv)
-          _d, _s, sec, entries = mv.load("dist/coresight-etm4x.ko")
-          zero = [n for _i, _o, c, n in entries if not c]
-          print(f"__versions: {len(entries)} entries, {len(zero)} with a zero CRC")
-          if zero:
-              print("zero-CRC entries:", ", ".join(zero))
-              sys.exit(1)
-          PY
 
-      - name: Compare against the device's own coresight.ko
+      - name: Strip debug info for the shipped copy
         run: |
-          set +e
-          if [ -f refs/coresight.ko ]; then
-            python3 tools/modversions.py compare refs/coresight.ko \
-              --target dist/coresight-etm4x.ko | tail -30
-          else
-            echo "no reference module committed"
-          fi
-          exit 0
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          cp dist/coresight-etm4x.ko dist/coresight-etm4x-unstripped.ko
+          llvm-objcopy --strip-debug dist/coresight-etm4x.ko
+          ls -l dist/
 
       - name: Package KernelSU / Magisk module zip
         run: |
@@ -250,6 +264,7 @@ jobs:
           name: coresight-etm4x
           path: |
             dist/coresight-etm4x.ko
+            dist/coresight-etm4x-unstripped.ko
             dist/ksu-coresight-etm4x.zip
           if-no-files-found: error
           retention-days: 30
