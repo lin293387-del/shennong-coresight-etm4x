@@ -13,6 +13,12 @@ VERFILE=$MODDIR/verified-kernel
 mkdir -p "$STATE" 2>/dev/null
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$LOG" 2>/dev/null; }
 
+# The switches that decide the layout of every struct this module shares with the
+# kernel (struct module above all).  Pinned as a hash so a config change is caught
+# even if `uname -r` somehow did not move.
+ABI_CONFIG_RE='^CONFIG_(DEBUG_INFO_BTF_MODULES|DEBUG_INFO_BTF|CFI_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|SHADOW_CALL_STACK|MODVERSIONS|MODULE_UNLOAD|PREEMPT|BPF_EVENTS|JUMP_LABEL|KPROBES|KUNIT|TRACEPOINTS|MODULE_SIG_PROTECT|TRIM_UNUSED_KSYMS)=|^# CONFIG_(DEBUG_INFO_BTF_MODULES|CFI_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|PREEMPT|BPF_EVENTS|JUMP_LABEL) '
+abi_hash() { zcat /proc/config.gz 2>/dev/null | grep -E "$ABI_CONFIG_RE" | sort | sha256sum | cut -d' ' -f1; }
+
 # our own kill switch (set by the watchdog, or by hand)
 if [ -f "$STATE/DISABLE" ]; then
     log "DISABLE present -> not loading"
@@ -39,16 +45,24 @@ fi
 # `uname -r` into $VERFILE and reboot.
 WANT=$(cat "$VERFILE" 2>/dev/null)
 HAVE=$(uname -r)
-if [ -n "$WANT" ] && [ "$WANT" != "$HAVE" ]; then
-    rm -f "$STATE/kernel-changed"
+ABIFILE=$MODDIR/verified-abihash
+WANT_ABI=$(cat "$ABIFILE" 2>/dev/null)
+HAVE_ABI=$(abi_hash)
+REASON=""
+[ -n "$WANT" ] && [ "$WANT" != "$HAVE" ] && REASON="uname -r moved ('$WANT' -> '$HAVE')"
+if [ -z "$REASON" ] && [ -n "$WANT_ABI" ] && [ "$WANT_ABI" != "$HAVE_ABI" ]; then
+    REASON="ABI config switches changed (sha256 $WANT_ABI -> $HAVE_ABI)"
+fi
+if [ -n "$REASON" ]; then
     {
-        echo "verified for: ${WANT:-<none>}"
-        echo "running     : $HAVE"
+        echo "reason      : $REASON"
+        echo "verified for: ${WANT:-<none>}  abi ${WANT_ABI:-<none>}"
+        echo "running     : $HAVE  abi $HAVE_ABI"
         echo "since       : $(date '+%Y-%m-%d %H:%M:%S')"
     } > "$STATE/kernel-changed" 2>/dev/null
-    log "REFUSING TO LOAD: built/verified for '$WANT' but running '$HAVE'."
-    log "  -> kernel (or its ABI-relevant config) changed; the old .ko may panic the loader."
-    log "  -> re-run the offline gate, rebuild, update $VERFILE, reboot."
+    log "REFUSING TO LOAD: $REASON"
+    log "  -> this .ko is ABI- and CRC-matched to one kernel; reloading it blindly can panic the loader."
+    log "  -> re-run the offline gate, rebuild, update verified-kernel / verified-abihash, reboot."
     exit 0
 fi
 rm -f "$STATE/kernel-changed"
