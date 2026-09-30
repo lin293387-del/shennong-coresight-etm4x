@@ -1,6 +1,6 @@
 id=coresight_etm4x
 name=CoreSight ETE0-7 (coresight-etm4x) for shennong / SM8650
-version=v1.1
-versionCode=2
+version=v1.2
+versionCode=3
 author=lin293387-del
-description=Loads coresight-etm4x.ko at boot so the APSS ETE0-7 trace sources get their driver and perf/simpleperf cs_etm instruction tracing works. Touches /data only, never a partition. Disabling OR removing the module restores stock behaviour (after a reboot, or immediately via the Action button). Self-disables if a boot fails to complete.
+description=Loads coresight-etm4x.ko at boot so the APSS ETE0-7 trace sources get their driver and perf/simpleperf cs_etm instruction tracing works. Touches /data only, never a partition. Pinned to one verified kernel, so a system update makes it refuse to load instead of risking the boot loader. Disabling OR removing it restores stock behaviour (after a reboot, or immediately via the Action button).
