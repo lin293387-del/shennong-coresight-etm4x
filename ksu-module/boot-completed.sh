@@ -23,14 +23,25 @@ fi
 log "boot completed with the module -> success recorded"
 
 {
-    echo "generated : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "kernel    : $(uname -r)"
+    echo "generated: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "kernel   : $(uname -r)"
+    echo "verified : $(cat "$MODDIR/verified-kernel" 2>/dev/null || echo '<unknown>')"
     echo
 
-    if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
-        echo "module    : LOADED"
+    if [ -f "$STATE/kernel-changed" ]; then
+        echo "guard    : REFUSED - the kernel changed since this .ko was verified"
+        sed 's/^/           /' "$STATE/kernel-changed"
+        echo "           re-run the offline gate, rebuild, update verified-kernel, reboot."
+    elif [ -f "$STATE/DISABLE" ]; then
+        echo "guard    : DISABLE flag present"
     else
-        echo "module    : NOT LOADED"
+        echo "guard    : ok"
+    fi
+
+    if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
+        echo "module   : LOADED"
+    else
+        echo "module   : NOT LOADED"
     fi
     echo
 
