@@ -51,7 +51,7 @@ static const struct of_device_id etm4_sysreg_match[] = {
 
 ## Why a module built from a different tree still loads
 
-Three kernel behaviours add up:
+Three kernel behaviours add up.
 
 1. **`kernel/module/version.c :: same_magic()`** — when the module carries a
    `__versions` section (`CONFIG_MODVERSIONS`) the kernel compares *only* the
@@ -68,15 +68,32 @@ Three kernel behaviours add up:
    So `6.1.25-…` vs `6.1.138-…` does not matter; only
    `SMP preempt mod_unload modversions aarch64` must match.
 
-2. **`check_version()`** — a recorded symbol CRC of `0` is accepted outright:
+2. **`check_version()` compares CRCs exactly, and only tolerates *missing*
+   entries.** There is no "CRC 0 means anything goes" escape hatch — an earlier
+   revision of this repository assumed there was one and the device rejected the
+   result with `coresight_etm4x: disagrees about version of symbol module_layout`
+   (`insmod: Exec format error`). The real code is:
 
    ```c
-   if (versions[i].crc == 0) return 1;
-   pr_warn("%s: no symbol version for %s\n", …); return 1;
+   for (i = 0; i < num_versions; i++) {
+           if (strcmp(versions[i].name, symname) != 0)
+                   continue;
+           crcval = *crc;
+           if (versions[i].crc == crcval)   /* exact match, no special case */
+                   return 1;
+           goto bad_version;
+   }
+   pr_warn_once("%s: no symbol version for %s\n", info->name, symname);
+   return 1;                                /* absent -> accepted */
    ```
 
-   That is what `tools/modversions.py zero` exploits, which is why the CI also
-   emits a `-crc0` variant and the KernelSU zip uses it.
+   So each imported symbol must either be **absent** from `__versions` or carry
+   the **exact** CRC the kernel publishes. `refs/kernel.symvers` supplies the
+   latter: `tools/collect_crcs.py` harvests the CRCs from the vendor modules
+   already installed on the device (they import the same kernel symbols and load
+   successfully, so the CRC they recorded *is* the expected one). Anything
+   modpost still cannot resolve is left out and accepted via the `return 1`
+   above.
 
 3. **`kernel/module/signing.c`** — with `CONFIG_MODULE_SIG_PROTECT=y`
    (present in the device config) signature enforcement is disabled:
@@ -97,9 +114,10 @@ Three kernel behaviours add up:
 .github/workflows/build.yml   clone kernel -> fetch AOSP clang -> build -> package
 ksu-module/                   KernelSU/Magisk module skeleton (module.prop + scripts)
 tools/repair_tree.py          disable Kconfig sources missing from the OSS snapshot
-tools/patch_modpost.py        make modpost emit CRC 0 for every imported symbol
+tools/collect_crcs.py         harvest expected symbol CRCs from the device's own modules
 tools/modversions.py          dump / zero / compare `__versions` CRCs
 tools/check_symbols.py        verify every imported symbol exists in /proc/kallsyms
+refs/kernel.symvers           the harvested symbol -> CRC map, fed to modpost
 ```
 
 Two tree fixes are needed because Xiaomi's OSS snapshot does not match the tree
@@ -121,13 +139,13 @@ that produced the shipping build:
 | property | module built here | device kernel / modules | verdict |
 |---|---|---|---|
 | `vermagic` | `6.1.25-g1c27eb534afc SMP preempt mod_unload modversions aarch64` | `6.1.138-android14-11-g0c3d559bcd85-ab14529422 SMP preempt mod_unload modversions aarch64` | **OK** — `same_magic()` drops the first token when `__versions` exists, leaving an identical ` SMP preempt mod_unload modversions aarch64` |
-| `__versions` section | present, 62 entries, all CRC `0` | required for the above | **OK** — `check_version()` returns 1 immediately on a CRC of 0 |
+| `__versions` section | present; 44 entries with the exact CRC this kernel publishes, the remaining 18 imported symbols omitted | exact-CRC check, absent entries accepted | **OK** — see `tools/collect_crcs.py` |
 | signature | unsigned | `CONFIG_MODULE_SIG_PROTECT=y` | **OK** — that option forces `sig_enforce = false` |
 | CFI / LTO mode | `LTO_NONE` + `CFI_CLANG` + `SHADOW_CALL_STACK`, clang 17.0.2 r487747c | identical | **OK** |
 | DT match table | `arm,embedded-trace-extension`, `qcom,skip-power-up` present in the object | DT has `ete0..7` with exactly those properties | **OK** |
 | imported symbols | 61 undefined symbols, 9 of them `coresight_*` | all 61 present in `/proc/kallsyms`, including every `coresight_*` | **OK** |
 
-Reproduce the last row with:
+Reproduce the symbol row with:
 
 ```sh
 su -c 'cat /proc/kallsyms' | awk '{print $3}' | sort -u > kallsyms.txt

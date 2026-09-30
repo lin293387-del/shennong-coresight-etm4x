@@ -17,8 +17,12 @@ name: Build coresight-etm4x.ko (shennong / SM8650)
 #     built here loads on the 6.1.138 device kernel even though this tree is
 #     based on 6.1.25.
 #
-#   * kernel/module/version.c :: check_version() treats a recorded symbol CRC of
-#     0 as a match, which is what tools/patch_modpost.py arranges.
+#   * kernel/module/version.c :: check_version() compares the recorded CRC of
+#     every imported symbol *exactly*, and only accepts a symbol that is not
+#     listed in __versions at all.  refs/kernel.symvers therefore carries the
+#     exact CRCs the device kernel publishes, harvested from the vendor modules
+#     that already load on it (tools/collect_crcs.py); anything modpost cannot
+#     resolve this way is skipped and accepted.
 #
 #   * kernel/module/signing.c: with CONFIG_MODULE_SIG_PROTECT=y (device config)
 #     signature enforcement is off, so an unsigned module loads.
@@ -91,12 +95,6 @@ jobs:
           set -x
           python3 tools/repair_tree.py "$SRC"
 
-      - name: Patch modpost to emit CRC 0 for every symbol
-        run: |
-          set -x
-          python3 tools/patch_modpost.py "$SRC/scripts/mod/modpost.c"
-          sed -n '/static void add_versions/,/^}/p' "$SRC/scripts/mod/modpost.c"
-
       - name: Fix known vendor prototype drift
         run: |
           set -x
@@ -136,6 +134,24 @@ jobs:
           cd "$SRC"
           make ARCH=arm64 LLVM=1 O=out -j"$(nproc)" modules_prepare
 
+      - name: Install harvested symbol CRCs
+        run: |
+          set -eux
+          # refs/kernel.symvers maps every vmlinux symbol this kernel publishes
+          # a CRC for to the exact value it checks against, harvested from the
+          # vendor modules that already load successfully on the device (see
+          # tools/collect_crcs.py).  Giving modpost this file means the entries
+          # it writes into __versions carry the right CRCs.
+          #
+          # Symbols that are *absent* from Module.symvers bring modpost to skip
+          # the entry entirely (its `if (!s->crc_valid) continue;` branch), and
+          # kernel/module/version.c accepts a symbol that is not listed at all -
+          # it only fails on a recorded CRC that differs.
+          wc -l refs/kernel.symvers
+          head -3 refs/kernel.symvers
+          cp refs/kernel.symvers "$SRC/out/Module.symvers"
+          ls -l "$SRC/out/Module.symvers"
+
       - name: Build coresight modules
         run: |
           set -eux
@@ -165,7 +181,7 @@ jobs:
           echo "----- sections -----"
           strings "$KO" | grep -iE 'coresight-etm4x|kcfi|__cfi' | head -10 || true
 
-      - name: Verify __versions is present
+      - name: Verify __versions looks sane
         run: |
           set -eux
           cd "$GITHUB_WORKSPACE"
@@ -173,9 +189,22 @@ jobs:
             echo "::error::module has no __versions section; same_magic() would compare the full vermagic and the module would be rejected"
             exit 1
           fi
-          cp dist/coresight-etm4x.ko dist/coresight-etm4x-crc0.ko
-          python3 tools/modversions.py zero dist/coresight-etm4x-crc0.ko
-          python3 tools/modversions.py dump dist/coresight-etm4x-crc0.ko | head -10
+          # Every recorded CRC must be non-zero: kernel/module/version.c compares
+          # them exactly, and a zero would only ever be accepted if the kernel
+          # itself happened to publish a zero CRC for that symbol.
+          python3 - <<'PY'
+          import importlib.util, sys
+          spec = importlib.util.spec_from_file_location(
+              "mv", "tools/modversions.py")
+          mv = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mv)
+          _d, _s, sec, entries = mv.load("dist/coresight-etm4x.ko")
+          zero = [n for _i, _o, c, n in entries if not c]
+          print(f"__versions: {len(entries)} entries, {len(zero)} with a zero CRC")
+          if zero:
+              print("zero-CRC entries:", ", ".join(zero))
+              sys.exit(1)
+          PY
 
       - name: Compare against the device's own coresight.ko
         run: |
@@ -192,7 +221,7 @@ jobs:
         run: |
           set -eux
           cd "$GITHUB_WORKSPACE"
-          cp dist/coresight-etm4x-crc0.ko ksu-module/coresight-etm4x.ko
+          cp dist/coresight-etm4x.ko ksu-module/coresight-etm4x.ko
           chmod +x ksu-module/post-fs-data.sh ksu-module/service.sh
           ( cd ksu-module && zip -r9 "$GITHUB_WORKSPACE/dist/ksu-coresight-etm4x.zip" . )
           unzip -l dist/ksu-coresight-etm4x.zip
@@ -203,7 +232,6 @@ jobs:
           name: coresight-etm4x
           path: |
             dist/coresight-etm4x.ko
-            dist/coresight-etm4x-crc0.ko
             dist/ksu-coresight-etm4x.zip
           if-no-files-found: error
           retention-days: 30
