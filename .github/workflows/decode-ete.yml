@@ -62,14 +62,29 @@ jobs:
 
       - name: Build perf with CoreSight/OpenCSD support
         run: |
-          git clone --depth=1 -b android14-6.1 https://android.googlesource.com/kernel/common kernel
-          cd kernel/tools/perf
-          make -j"$(nproc)" WERROR=0 CORESIGHT=1 VF=1 2>&1 | tail -40
-          echo "=== perf version ==="
+          set -x
+          sudo ldconfig
+          echo "uname -m=$(uname -m)"
+          echo "=== OpenCSD install check ==="
+          ls -l /usr/local/lib/libopencsd* 2>/dev/null || true
+          ls -d /usr/local/include/opencsd 2>/dev/null || true
+
+          # Use the released kernel.org tarball rather than a git clone: it is a
+          # complete, self-consistent tree, which is what tools/perf expects.
+          # (A shallow clone of the Android common kernel tree failed to build
+          #  with "Inconsistent word size. Check asm/bitsperlong.h".)
+          curl -fL --retry 3 -o linux.tar.xz \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz
+          ls -l linux.tar.xz
+          tar xf linux.tar.xz
+          cd linux-6.1/tools/perf
+          ls include/asm/bitsperlong.h ../include/asm/bitsperlong.h 2>/dev/null || true
+          make -j"$(nproc)" WERROR=0 CORESIGHT=1 CSTRACE_PATH=/usr/local \
+               VF=1 NO_PYTHON=1 2>&1 | tail -60
+          ls -l perf
           ./perf version
-          echo "=== CoreSight support check ==="
-          ./perf version --build-options | tee build-options.txt
-          grep -i -E 'coresight|opencsd' build-options.txt || {
+          ./perf version --build-options | tee "$GITHUB_WORKSPACE/build-options.txt"
+          grep -i -E 'coresight|opencsd' "$GITHUB_WORKSPACE/build-options.txt" || {
             echo "!! perf was NOT built with CORESIGHT support"; exit 1; }
 
       - name: Fetch trace from release asset
@@ -85,7 +100,8 @@ jobs:
       - name: Decode -- raw AUX / packet dump
         run: |
           set +e
-          ./kernel/tools/perf/perf report --stdio --dump -i "$ASSET" > dump.txt 2>&1
+          PERF=./linux-6.1/tools/perf/perf
+          $PERF report --stdio --dump -i "$ASSET" > dump.txt 2>&1
           echo "exit=$?"
           echo "================= first 80 lines ================="
           head -80 dump.txt
@@ -97,17 +113,19 @@ jobs:
       - name: Decode -- perf inject instruction samples + branch history
         run: |
           set +e
-          ./kernel/tools/perf/perf inject -i "$ASSET" -o inj.data --itrace=${{ inputs.itrace }} -v > inject.log 2>&1
+          PERF=./linux-6.1/tools/perf/perf
+          $PERF inject -i "$ASSET" -o inj.data --itrace=${{ inputs.itrace }} -v > inject.log 2>&1
           echo "inject exit=$?"
           tail -40 inject.log
           ls -l inj.data 2>/dev/null
+          echo "================= perf report --header-only ================="
+          $PERF report --stdio -i inj.data --header-only 2>&1 | head -20
           echo "================= perf report ================="
-          ./kernel/tools/perf/perf report --stdio -i inj.data --header-only 2>&1 | head -20
-          ./kernel/tools/perf/perf report --stdio -i inj.data 2>&1 | head -40
+          $PERF report --stdio -i inj.data 2>&1 | head -40
           echo "================= perf script ================="
-          ./kernel/tools/perf/perf script -i inj.data 2>&1 | head -30
-          echo "================= sample census ================="
-          ./kernel/tools/perf/perf report --stdio -i inj.data --stats 2>&1 | head -30
+          $PERF script -i inj.data 2>&1 | head -30
+          echo "================= perf report --stats ================="
+          $PERF report --stdio -i inj.data --stats 2>&1 | head -30
 
       - name: Upload results
         if: always()
