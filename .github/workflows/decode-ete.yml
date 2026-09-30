@@ -106,6 +106,7 @@ jobs:
 
       - name: Decode -- packet dump
         run: |
+          set +e
           PERF=./linux-6.1/tools/perf/perf
           timeout 1200 $PERF report --stdio --dump -i "$ASSET" > dump.txt 2>&1
           echo "dump exit=$?  dump.txt size=$(stat -c%s dump.txt)"
@@ -122,6 +123,7 @@ jobs:
 
       - name: Decode -- perf inject instruction samples + branch history
         run: |
+          set +e
           PERF=./linux-6.1/tools/perf/perf
           timeout 1200 $PERF inject -i "$ASSET" -o inj.data --itrace=${{ inputs.itrace }} -v > inject.log 2>&1
           echo "inject exit=$?"
