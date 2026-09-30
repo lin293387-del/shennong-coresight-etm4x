@@ -1,82 +1,55 @@
 #!/system/bin/sh
 #
-# CoreSight ETE/ETMv4 loader for Xiaomi 14 Pro (shennong / SM8650)
-# ---------------------------------------------------------------
-# Xiaomi's shipping vendor-module config enables the CoreSight infrastructure
-# but never ships coresight-etm4x.ko, so the DT nodes ete0..7
-# ("arm,embedded-trace-extension") have no driver and the perf "cs_etm" PMU
-# ends up with zero CPUs.  This script loads the module at boot.
+# CoreSight ETE loader for Xiaomi 14 Pro (shennong / SM8650) -- stage 1/3
+# ----------------------------------------------------------------------
+# Xiaomi's shipping vendor_dlkm enables the whole CoreSight infrastructure but
+# never builds CONFIG_CORESIGHT_SOURCE_ETM4X, so the DT nodes
+# /soc/ete0..ete7 ("arm,embedded-trace-extension") have no driver, the perf
+# cs_etm PMU ends up with no sources, and instruction tracing is impossible.
+# This module loads the one missing driver (.ko) at boot.
 #
-# Safety design
-# -------------
-#   * Only /data is touched.  No signed/AVB/dynamic partition is modified, so
-#     there is no path to a hard brick and uninstalling this module (or just
-#     deleting the files) restores the stock behaviour exactly.
-#   * If insmod fails, or the driver refuses to probe, nothing else changes:
-#     the ETE platform devices simply stay unbound, i.e. stock behaviour.
-#   * A boot-attempt watchdog counts boots that never reached service.sh.
-#     After MAX_ATTEMPTS such boots it writes DISABLE and stops loading, so a
-#     module that turns out to break boot repairs itself within a few reboots.
-#   * /data/adb/coresight/DISABLE is an absolute kill switch.  It is trivial to
-#     create from a custom recovery or from `adb shell` if anything goes wrong.
-#   * KernelSU/Magisk can also be put into safe mode by holding Volume Down
-#     while booting, which skips all module scripts unconditionally.
+# KernelSU module contract (https://kernelsu.org/guide/module.html):
+#   * /data/adb/modules/<id>/disable  exists -> module is disabled, no script runs
+#   * /data/adb/modules/<id>/remove   exists -> module is deleted on next boot
+#     (and uninstall.sh runs first)
+#   * no 'system' directory here, so no metamodule is required
+# => disabling or removing this module restores stock behaviour, because the
+#    driver only ever lives in RAM: nothing outside /data is ever written, no
+#    partition, no boot image, no vendor_dlkm.
+#
+# Rescue paths, in order of preference:
+#   1. this script's own watchdog (below) -- after ONE boot that dies between
+#      "armed" and a completed boot, it writes $STATE/DISABLE and stops.
+#   2. KernelSU safe mode: press volume-down 3 separate times right after the
+#      first boot screen; all modules are disabled for that boot.
+#   3. `adb shell su -c 'ksud module disable coresight_etm4x'`
+#   4. Recovery: the HyperOS/MIUI built-in safe mode also disables KSU modules.
 #
 
 MODDIR=${0%/*}
 STATE=/data/adb/coresight
 LOG=$STATE/coresight.log
-KO=$MODDIR/coresight-etm4x.ko
-MAX_ATTEMPTS=3
 
 mkdir -p "$STATE" 2>/dev/null
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [post-fs-data] $*" >> "$LOG" 2>/dev/null
-}
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [post-fs-data] $*" >> "$LOG" 2>/dev/null; }
 
-# ---- manual kill switch -------------------------------------------------
-if [ -f "$STATE/DISABLE" ]; then
-    log "DISABLE flag present -> not loading (delete $STATE/DISABLE to re-enable)"
-    exit 0
-fi
+log "--- boot start (kernel $(uname -r)) ---"
 
-# ---- boot-attempt watchdog ---------------------------------------------
-attempts=$(cat "$STATE/attempts" 2>/dev/null)
-case "$attempts" in
-    ''|*[!0-9]*) attempts=0 ;;
-esac
-
-if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+# ---- 1. did the previous boot die after we armed the insmod? --------------
+# service.sh touches 'armed' immediately before insmod and removes it as soon
+# as insmod returns.  So if 'armed' is still here, the kernel did not survive
+# the load (panic + watchdog reset).  A kernel panic here is deterministic, so
+# disable on the first occurrence instead of burning more reboots.
+if [ -f "$STATE/armed" ]; then
+    rm -f "$STATE/armed"
     touch "$STATE/DISABLE"
-    log "watchdog: $attempts boots never completed -> DISABLED (delete $STATE/DISABLE to retry)"
-    exit 0
-fi
-echo $((attempts + 1)) > "$STATE/attempts"
-log "boot attempt $((attempts + 1))/$MAX_ATTEMPTS"
-
-# ---- load ---------------------------------------------------------------
-if [ ! -f "$KO" ]; then
-    log "missing $KO -> nothing to do"
+    log "WATCHDOG: previous boot did not survive the module load -> DISABLED."
+    log "WATCHDOG: delete $STATE/DISABLE to retry after fixing the team's .ko"
     exit 0
 fi
 
-if grep -q '^coresight_etm4x ' /proc/modules 2>/dev/null; then
-    log "coresight_etm4x already loaded"
-    exit 0
-fi
-
-insmod "$KO" 2>>"$LOG"
-rc=$?
-log "insmod $KO rc=$rc"
-
-# ---- report -------------------------------------------------------------
-found=0
-for dev in /sys/bus/coresight/devices/coresight-ete*; do
-    [ -e "$dev" ] || continue
-    found=$((found + 1))
-    log "registered $(basename "$dev")"
-done
-log "ete devices registered: $found"
+# ---- 2. new boot: success is not proven yet -------------------------------
+rm -f "$STATE/boot_ok"
 
 exit 0
