@@ -168,6 +168,26 @@ jobs:
           ./scripts/config --file out/.config --module CORESIGHT
           ./scripts/config --file out/.config --module CORESIGHT_SOURCE_ETM4X
           ./scripts/config --file out/.config --disable MODULE_SIG_ALL
+          # WERROR has no effect on the generated code, but the device's GKI build
+          # never compiled this driver (`# CONFIG_CORESIGHT is not set` in the
+          # shipping config), so there is no evidence that
+          # coresight-etm4x-core.c is warning-free with this clang.  A single
+          # warning would otherwise kill the build.
+          ./scripts/config --file out/.config --disable WERROR
+          # ACK/GKI build plumbing, unrelated to the module itself:
+          #   CONFIG_TRIM_UNUSED_KSYMS=y
+          #   CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"
+          # `make modules_prepare` needs include/generated/autoksyms.h, whose
+          # generator scripts/gen_autoksyms.sh hard-fails when that whitelist file
+          # is absent:
+          #   ERROR: '.../abi_symbollist.raw' whitelist file not found
+          # The file is a *generated* artifact of the full GKI build (build_abi.sh),
+          # not part of the source tarball, and it only decides which of the
+          # kernel's own exports survive trimming - a vmlinux concern we never
+          # build here.  An empty file satisfies the check and changes nothing for
+          # this module: its imports resolve through refs/kernel.symvers and the
+          # device's own symbol table (see the import gate in the ABI gate step).
+          : > abi_symbollist.raw
           # LOCALVERSION is only cosmetic: same_magic() drops the first token when
           # the module carries __versions.  Make it match anyway.
           LOCALVERSION="-android14-11" make ARCH=arm64 LLVM=1 O=out olddefconfig
@@ -307,6 +327,19 @@ jobs:
           }
           python3 tools/preflight.py dist/coresight-etm4x.ko \
             --vendor refs/ref-coresight.ko --etm4x --strict-cfi
+          # every symbol we import must be *exported* by the device kernel or by a
+          # module already loaded there.  The device is built with
+          # CONFIG_TRIM_UNUSED_KSYMS=y, so a plausible-looking symbol can be
+          # missing from the export table -> "Unknown symbol ... (err -2)".
+          # refs/exported-symbols.txt was harvested from the device's own
+          # /proc/kallsyms (12k __ksymtab_* names) - read-only, so this gate works
+          # without the phone.
+          if [ -f refs/exported-symbols.txt ]; then
+            python3 tools/import_gate.py dist/coresight-etm4x.ko refs/exported-symbols.txt
+          else
+            echo "::warning::refs/exported-symbols.txt missing - skipping the import gate"
+            echo "::warning::(regenerate it with: tools/import_gate.py --list kallsyms out.txt)"
+          fi
           if [ -f refs/vmlinux.btf ]; then
             python3 tools/preflight.py dist/coresight-etm4x.ko --btf refs/vmlinux.btf || true
           fi
