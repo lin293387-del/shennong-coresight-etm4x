@@ -95,6 +95,24 @@ Three kernel behaviours add up.
    modpost still cannot resolve is left out and accepted via the `return 1`
    above.
 
+   The one thing that must *not* happen is modpost inventing a CRC. It does that
+   for any symbol exported by a module built in the same run: it runs genksyms
+   over **this** tree's headers, which yields a different value than the
+   `coresight.ko` already on the device publishes. The first working revision
+   still tripped over exactly this:
+
+   ```
+   coresight_register   ours 0x459d07a5   device 0xa815b2ed   -> rejected
+   module_layout        ours 0xea759d7f   device 0xea759d7f   -> fine (came from symvers)
+   ```
+
+   The CI therefore trims `drivers/hwtracing/coresight/Makefile` down to the
+   `coresight-etm4x` object, so `coresight_register`, `cscfg_*`,
+   `etm_perf_symlink` and friends stay unresolved and are simply omitted from
+   `__versions` - which this kernel accepts. The device already ships
+   `coresight.ko`, `coresight-tmc.ko`, funnel and replicator, so nothing else
+   needs building.
+
 3. **`kernel/module/signing.c`** — with `CONFIG_MODULE_SIG_PROTECT=y`
    (present in the device config) signature enforcement is disabled:
 
@@ -139,7 +157,7 @@ that produced the shipping build:
 | property | module built here | device kernel / modules | verdict |
 |---|---|---|---|
 | `vermagic` | `6.1.25-g1c27eb534afc SMP preempt mod_unload modversions aarch64` | `6.1.138-android14-11-g0c3d559bcd85-ab14529422 SMP preempt mod_unload modversions aarch64` | **OK** — `same_magic()` drops the first token when `__versions` exists, leaving an identical ` SMP preempt mod_unload modversions aarch64` |
-| `__versions` section | present; 44 entries with the exact CRC this kernel publishes, the remaining 18 imported symbols omitted | exact-CRC check, absent entries accepted | **OK** — see `tools/collect_crcs.py` |
+| `__versions` section | present; entries carry the exact CRC this kernel publishes; module-exported symbols are omitted rather than guessed | exact-CRC check, absent entries accepted | **OK** — see `tools/collect_crcs.py` |
 | signature | unsigned | `CONFIG_MODULE_SIG_PROTECT=y` | **OK** — that option forces `sig_enforce = false` |
 | CFI / LTO mode | `LTO_NONE` + `CFI_CLANG` + `SHADOW_CALL_STACK`, clang 17.0.2 r487747c | identical | **OK** |
 | DT match table | `arm,embedded-trace-extension`, `qcom,skip-power-up` present in the object | DT has `ete0..7` with exactly those properties | **OK** |

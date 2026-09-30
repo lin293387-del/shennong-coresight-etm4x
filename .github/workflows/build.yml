@@ -128,6 +128,24 @@ jobs:
             out/.config | sort
           echo "-----------------------------------------"
 
+      - name: Build only the coresight-etm4x module
+        run: |
+          set -eux
+          MF="$SRC/drivers/hwtracing/coresight/Makefile"
+          # modpost computes the CRC of a symbol exported by a module built in
+          # the *same* run with genksyms from this tree's headers.  That value
+          # is not the one the device's coresight.ko publishes, so an import of
+          # coresight_register would be recorded with a CRC this kernel rejects
+          # ("disagrees about version of symbol coresight_register").
+          #
+          # Leaving those modules out of the build keeps their symbols
+          # unresolved, which makes modpost skip the entry entirely - and
+          # kernel/module/version.c accepts a symbol that is not listed in
+          # __versions.  Only the etm4x object is needed anyway: the device
+          # already ships coresight.ko, coresight-tmc.ko, funnel, replicator ...
+          sed -i -E '/^obj-\$\(CONFIG_/ {/coresight-etm4x/!s/^/# trimmed by CI: /}' "$MF"
+          grep -n -E '^obj-|^# trimmed by CI' "$MF"
+
       - name: Prepare build
         run: |
           set -eux
